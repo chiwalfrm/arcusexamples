@@ -5,7 +5,9 @@ Recommended OS: Ubuntu 24.04.4 LTS server
 - redis (caches data)
 
 **Required Pip3 Libraries**
-- aiohttp (wsorderbook.py creates a web server that serves the orderbook to clients)
+- aiohttp (public/wsorderbook.py creates a web server that serves the orderbook to clients)
 - websockets
 - cryptography
 - redis
+
+Note: private/ordersign.py is provided by dYdX Trading, Inc.  All rights reserved.
