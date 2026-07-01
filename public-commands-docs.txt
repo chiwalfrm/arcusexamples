@@ -1,0 +1,258 @@
+================================================================================
+ARCUS PUBLIC COMMANDS — DOCUMENTATION
+================================================================================
+
+The scripts in arcus/public/ are the READ-ONLY / display half of the Arcus
+toolkit. They are DELIBERATELY SELF-CONTAINED: they do NOT import the signing
+stack (ordersign.py / arcus_common.py) or read any creds file, and they never
+sign a request. Everything here uses public, unauthenticated endpoints —
+account-scoped reads take only an `address` query parameter and need NO
+signature, so a display tool needs just the address, not the account's keys.
+
+Common conventions across these tools:
+
+  NETWORK FLAG — every tool takes a REQUIRED, mutually-exclusive network flag:
+      --testnet   -> https://api.testnet.arcus.xyz     (wss://.../v1/ws)
+      --staging   -> https://api.staging.arcus.xyz
+      --mainnet   -> https://api.arcus.xyz             (live 2026-06-25; reads only)
+    (checkports.py is the exception — there the network flag is OPTIONAL and just
+    narrows the port range.)
+
+  --condensed / --header — the display_* tools emit a machine-readable form with
+    --condensed (CSV or a single raw value, no padding/totals). --header adds a
+    header row and is an ERROR without --condensed.
+
+  MONEY = Decimal — all monetary/size values are decimal strings parsed with
+    Decimal (never float), so cents line up and there are no binary-float artifacts.
+
+  Clean errors — network / HTTP / JSON failures become one-line SystemExit
+    messages, not tracebacks. Address args are validated locally (0x + 40 hex)
+    before any round-trip. A --market typo FAILS (resolved against /v1/markets)
+    rather than silently returning zero rows.
+
+  MARKET RESOLUTION — a market may be given as a case-insensitive display name OR
+    a numeric marketId; the canonical marketDisplayName is what the
+    l2OrderBook/WS-subscription paths expect.
+
+
+================================================================================
+ACCOUNT DISPLAY TOOLS (REST reads; positional <eth_address>)
+================================================================================
+
+--------------------------------------------------------------------------------
+display_balance.py — account balance / collateral
+--------------------------------------------------------------------------------
+  python3 display_balance.py <eth_address> --testnet
+  python3 display_balance.py <eth_address> --condensed --testnet   # raw equity only
+
+GET /v1/account. Prints a labeled table: Equity, Free collateral, Net quote
+balance, Net deposits, Pending deposits, Pending withdrawals, Open positions.
+  equity          = netQuoteBalance + Σ(size × oracle)   — total account value
+  freeCollateral  = equity − Σ initial margin            — available to trade
+  netQuoteBalance = aggregate cash as of the last event
+--condensed prints ONLY the raw equity value (no commas/label) for scripts; fails
+loudly if the field is absent rather than emitting an empty success line. A 404
+is reported as "no activity yet" (address valid but never traded/deposited).
+
+--------------------------------------------------------------------------------
+display_positions.py — open positions
+--------------------------------------------------------------------------------
+  python3 display_positions.py <eth_address> --testnet
+  python3 display_positions.py <eth_address> --condensed --testnet   # CSV market,quantity
+
+GET /v1/positions (positions keyed by stringified marketId; empty object = flat).
+Table columns: MARKET, SIDE, SIZE, ENTRY, MARK, LEV, MARGIN, NOTIONAL, uPnL,
+FUNDING, sorted by numeric marketId, with total unrealized-PnL and total-funding
+footers. MARK comes from oraclePx ("0"/absent shown as "-", since the venue then
+falls back to the entry price for notional/PnL). --condensed emits CSV
+"marketDisplayName,size" (raw signed quantity) per line.
+
+--------------------------------------------------------------------------------
+display_orders.py — order history (open / filled / canceled / rejected)
+--------------------------------------------------------------------------------
+  python3 display_orders.py <eth_address> --testnet                 # every order
+  python3 display_orders.py <eth_address> --status OPEN --testnet
+  python3 display_orders.py <eth_address> --status CANCELED --limit 50 --testnet
+
+GET /v1/orders. --limit 1-1000 (default/max 1000). --status filters LOCALLY (the
+API has no server-side status filter) to one of the venue's status values (OPEN,
+FILLED, CANCELED, REJECTED, PARTIALLY_FILLED, LIQUIDATED, ...). Sorted
+newest-first locally. Table shows CREATED, MARKET, SIDE, STATUS, TYPE, PRICE,
+SIZE, REMAINING, ORDER ID, CLIENTID; a "*" column marks partially-filled orders
+(0 < remainingSize < originalSize). --condensed emits one CSV row per order.
+
+--------------------------------------------------------------------------------
+display_fills.py — fills / trade history, newest-first
+--------------------------------------------------------------------------------
+  python3 display_fills.py <eth_address> --testnet                       # latest (<=1000)
+  python3 display_fills.py <eth_address> --market BTC-USD --testnet
+  python3 display_fills.py <eth_address> --from 1782000000000 --to 1782600000000 --testnet
+  python3 display_fills.py <eth_address> --limit 50 --condensed --testnet
+
+GET /v1/fills. --limit 1-1000. --from/--to are epoch MILLISECONDS (inclusive) to
+walk older history. The API has NO server-side market filter, so --market is
+resolved to a canonical marketId and applied LOCALLY within the fetched window —
+the output note is honest that older <market> fills may exist beyond the page.
+Table adds a fees + realized-PnL totals footer. --condensed emits CSV per fill
+(createdAt,market,side,size,price,fee,role,closedPnl,effect,tradeId,orderId).
+
+--------------------------------------------------------------------------------
+display_funding.py — funding payments, newest-first
+--------------------------------------------------------------------------------
+  python3 display_funding.py <eth_address> --testnet                     # last 30 days
+  python3 display_funding.py <eth_address> --market BTC-USD --testnet
+  python3 display_funding.py <eth_address> --from 1782000000000 --testnet
+  python3 display_funding.py <eth_address> --limit 50 --condensed --testnet
+
+GET /v1/funding. Sign convention: payment POSITIVE = received, NEGATIVE = paid;
+footer shows net / received / paid. Defaults to the LAST 30 DAYS when --from is
+omitted (widen with --from/--to). --market filters locally (no server-side
+filter), same as display_fills.
+UNIT ASYMMETRY (Arcus API, not a bug): request filters --from/--to are epoch
+MILLISECONDS, but the response `time` field is epoch MICROSECONDS — the tool
+handles both correctly. --condensed emits CSV (time,market,fundingRate,size,payment).
+
+
+================================================================================
+MARKET / ORDERBOOK TOOLS
+================================================================================
+
+--------------------------------------------------------------------------------
+showmarkets.py — list markets
+--------------------------------------------------------------------------------
+  python3 showmarkets.py --testnet                     # aligned table, common columns
+  python3 showmarkets.py --condensed --testnet         # CSV of common columns
+  python3 showmarkets.py --verbose --testnet           # aligned table, ALL fields
+  python3 showmarkets.py --verbosecondensed --testnet  # pipe-delimited, ALL fields
+
+GET /v1/markets, sorted by numeric marketId. Common columns: marketId,
+marketDisplayName, tickSize, stepSize, oraclePrice, status. Output modes are
+mutually exclusive (default table / --condensed / --verbose / --verbosecondensed);
+delimited output uses csv.writer so commas/pipes/quotes are escaped.
+
+  --createjson — LAUNCHER SUPPORT. Also writes the RAW /v1/markets response to a
+    cache file (best-effort atomic temp+os.replace) so the per-market sibling tools
+    (wsorderbook / showorderbook) resolve markets from that ONE file instead of each
+    re-hitting the server — collapsing a whole launcher run to a single markets call.
+    showmarkets runs FIRST in the launcher, so it's the natural creator. Path =
+    $ARCUS_MARKETS_CACHE if set (the launcher exports a PER-RUN path so a
+    foreign/stale file can never be trusted), else the network-scoped predictable
+    path /tmp/arcus_markets_<network>.json. showmarkets ALWAYS fetches fresh and
+    never READS the cache, so its own displayed output is never stale.
+
+--------------------------------------------------------------------------------
+showorderbook.py — display a market's order book (reads a wsorderbook server)
+--------------------------------------------------------------------------------
+  python3 showorderbook.py BTC-USD --testnet
+  python3 showorderbook.py BTC-USD --nlevels 10 --usd --testnet
+  python3 showorderbook.py BTC-USD --looping --testnet          # live-refresh (clears screen)
+  python3 showorderbook.py BTC-USD --checkserver --testnet      # health probe, then exit
+  python3 showorderbook.py BTC-USD --server otherhost --testnet
+
+Resolves the market to a marketId (numeric, or name via /v1/markets — using the
+launcher cache fail-open, warming it on a miss), then reads the LOCAL wsorderbook
+HTTP server at http://<--server>:<PORT_BASE[net]+marketId>/orderbook
+(PORT_BASE: mainnet 10000 / testnet 11000 / staging 12000; default host localhost).
+Prints a two-sided depth table (cumulative bid/ask, sizes, prices) with the spread;
+--usd shows sizes in USD notional; --nlevels caps depth; --looping refreshes each
+second. Crossed levels (bid>=ask) are resolved by sequence id and reported.
+NOT-READY handling: HTTP 503 or a body with ready=false prints "not ready yet"
+(warming up / resyncing) rather than a stale/empty book.
+  --checkserver — connect only; exit 0 if the server answers with ANY HTTP status
+    (used as the launcher's post-start health gate), exit 1 if unreachable.
+
+--------------------------------------------------------------------------------
+wsorderbook.py — maintain an L2 book from the WS stream, serve it over HTTP
+--------------------------------------------------------------------------------
+  python3 wsorderbook.py BTC-USD --testnet
+  python3 wsorderbook.py BTC-USD --host 0.0.0.0 --log-dir /tmp/ob --testnet
+
+The BACKEND that showorderbook reads. Resolves the market (numeric id or name;
+launcher cache fail-open, warmed on miss), subscribes over WebSocket to
+l2OrderbookUpdates (nLevels 100) + trades + oraclePrices, applies the snapshot +
+deltas into a local Decimal-keyed book, and serves it at
+http://<--host>:<PORT_BASE[net]+marketId>/orderbook (default host 127.0.0.1;
+0.0.0.0 to expose). The endpoint returns 503 {"ready": false} until the first
+snapshot arrives, so a caller never mistakes "not ready" for "no liquidity".
+INTEGRITY: the per-market lastSequenceId is gap-checked — on a gap, a clean close,
+or any WS error it resets the book and re-subscribes for a fresh snapshot (so the
+local book can't drift silently); reconnects use exponential backoff (1..60s).
+Each channel is logged to a rotating file under /mnt/arcuslogs/<network>
+(--log-dir to override; --timestamp wraps each line as JSONL with receivedAt);
+unknown/unparseable frames go to stdout.
+
+--------------------------------------------------------------------------------
+checkports.py — pre-deploy scan of the orderbook-server port range
+--------------------------------------------------------------------------------
+  python3 checkports.py                              # scan 10000-12999 on 127.0.0.1
+  python3 checkports.py --testnet                    # only that network's band (11000-11999)
+  python3 checkports.py --host 0.0.0.0               # check the public-bind interface
+  python3 checkports.py --start 11000 --end 11999    # explicit custom range
+  python3 checkports.py --quiet                      # summary + conflicts only
+
+Deploy gate: checks nothing already occupies the ports wsorderbook servers bind
+(PORT_BASE[net] + marketId). Test-binds AND listens on each TCP port with
+SO_REUSEADDR — mirroring wsorderbook's aiohttp socket exactly, so a port reported
+free is one the server can really take. --host MUST match the host wsorderbook
+binds (both default 127.0.0.1); scan 0.0.0.0 if you deploy 0.0.0.0.
+Network flags (OPTIONAL here) narrow the scan to one 1000-port band and are
+REJECTED if combined with --start/--end. The reserved base ports
+(10000/11000/12000) are never bound by a server (marketIds start at 1) — reported
+as a note, never a blocker.
+EXIT STATUS (gates a deploy script): 0 = all free (clear to deploy);
+1 = one or more server ports in use (resolve first); 2 = a port couldn't be tested
+(and none were in use).
+
+
+================================================================================
+WEBSOCKET LOGGERS (subscribe + log to rotating files; reconnect w/ backoff)
+================================================================================
+Both connect to wss://<network>/v1/ws, write one RotatingFileHandler file per
+channel under /mnt/arcuslogs/<network> (2 MiB × 4 backups; --log-dir to override),
+and reconnect with exponential backoff (1..60s). --timestamp wraps each line as
+JSONL with a local receivedAt (default: log the raw server frame). Unrecognized
+channels / unparseable frames go to STDOUT (capture stdout to keep them). Run with
+`python3 -u` for live streaming; these are meant to run as long-lived processes.
+
+--------------------------------------------------------------------------------
+wsaccount.py — log an account's per-account channels
+--------------------------------------------------------------------------------
+  python3 wsaccount.py 0xADDRESS --testnet
+  python3 wsaccount.py 0xADDRESS --log-dir /tmp/ws --channels account,orders --timestamp --testnet
+
+Positional <eth_address> (validated 0x+40 hex). Subscribes (snapshot=true, id=address)
+to the known account channels: accountAttributeUpdates, account, funding, orders,
+positions, userFills. --channels selects a comma-separated subset; an UNKNOWN
+channel (e.g. a typo "order") is REJECTED unless --allow-unknown-channel, so you
+don't silently create an empty log subscribed to nothing. One file per channel:
+<log-dir>/<channel><address>.log.
+
+--------------------------------------------------------------------------------
+wsexchange.py — log exchange-wide channels
+--------------------------------------------------------------------------------
+  python3 wsexchange.py --testnet
+  python3 wsexchange.py --log-dir /tmp/ws --max-bytes 5000000 --no-snapshot --timestamp --testnet
+
+No address (exchange-wide). Subscribes to exchangeAttributeUpdates and markets,
+one rotating file each (<log-dir>/<channel>.log). --max-bytes sets the rotation
+cap (>0; 0 would disable rotation). --no-snapshot subscribes without the initial
+snapshot. Ctrl-C stops cleanly.
+
+
+================================================================================
+LAUNCHER MARKETS-CACHE (how the three orderbook tools cooperate)
+================================================================================
+showmarkets --createjson (writer) and wsorderbook / showorderbook (readers) share
+one cache file so a launcher run makes ONE /v1/markets call total instead of one
+per market:
+
+  * Writer: showmarkets --createjson writes the raw {"markets":[...]} atomically.
+  * Readers: wsorderbook / showorderbook read it FAIL-OPEN — a missing / corrupt /
+    wrong-shape file just triggers a live fetch (and warms the cache), so the tools
+    still work standalone with no launcher and no cache present.
+  * Path: $ARCUS_MARKETS_CACHE if set, else /tmp/arcus_markets_<network>.json.
+    The launcher exports a PER-RUN path (PID-scoped) and removes it on exit, so a
+    foreign/stale file at the predictable path is never trusted and nothing outside
+    the run is affected. Only a payload whose "markets" is a LIST is accepted.
+    (Networks are never crossed — testnet/staging/mainnet marketId maps differ, so
+    the predictable path is network-scoped.)
