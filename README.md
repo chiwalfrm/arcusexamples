@@ -11,7 +11,7 @@ Recommended OS: Ubuntu 24.04.4 LTS server
 - redis
 
 **Documentation**
-private.txt - Documentation for the private/ commands
-public.txt - Documentation for the public/ commands
+- private-commands-docs.txt - Documentation for the private/ commands
+- public-commands-docs.txt - Documentation for the public/ commands
 
 Note: private/ordersign.py is provided by dYdX Trading, Inc.  All rights reserved.
