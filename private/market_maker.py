@@ -28,6 +28,7 @@ Resolves ordersign.py / arcus_creds_<network>.json relative to this script.
 
 import argparse
 import json
+import math
 import os
 import random
 import signal
@@ -229,7 +230,11 @@ class MarketMaker:
         since max-position is in BASE UNITS, not USD). Estimates the size from the oracle price."""
         if self.max_position is None:
             return
-        ref = self.oracle_price()
+        try:
+            ref = self.oracle_price()
+        except (OSError, json.JSONDecodeError):
+            return                                       # best-effort: a transient markets read (e.g. --no-cache
+                                                        # at boot) must not kill startup; the cycle re-checks anyway
         if ref is None or ref <= 0:
             return                                       # can't estimate; the cycle notes will show it
         bid_px = to_inc(ref * (1 - self.spread), self.tick, ROUND_FLOOR)
@@ -254,12 +259,22 @@ class MarketMaker:
             print(f"[{time.strftime('%H:%M:%S')}] l2OrderBook unavailable ({describe_error(e)}); pulling quotes")
             self.pull_quotes()
             return
-        bids, asks = ob.get("bids", []), ob.get("asks", [])
-        # Don't trust server ordering: best bid = highest, best ask = lowest.
-        asks = sorted(asks, key=lambda lv: Decimal(lv[0]))
-        bids = sorted(bids, key=lambda lv: Decimal(lv[0]), reverse=True)
-        best_bid = Decimal(bids[0][0]) if bids else None
-        best_ask = Decimal(asks[0][0]) if asks else None
+        # Parse/sort the book. A 2xx response can still carry MALFORMED data (non-numeric or
+        # short/wrong-shape levels, or `ob` not even a dict) -> InvalidOperation/TypeError/IndexError/
+        # KeyError/ValueError/AttributeError. Treat that exactly like an unreadable book: FAIL CLOSED
+        # (pull quotes + return) rather than let it bubble to run() (log-only) and leave stale 365-day
+        # GTT quotes resting at old prices.
+        try:
+            bids, asks = ob.get("bids", []), ob.get("asks", [])
+            # Don't trust server ordering: best bid = highest, best ask = lowest.
+            asks = sorted(asks, key=lambda lv: Decimal(lv[0]))
+            bids = sorted(bids, key=lambda lv: Decimal(lv[0]), reverse=True)
+            best_bid = Decimal(bids[0][0]) if bids else None
+            best_ask = Decimal(asks[0][0]) if asks else None
+        except (InvalidOperation, TypeError, IndexError, KeyError, ValueError, AttributeError) as e:
+            print(f"[{time.strftime('%H:%M:%S')}] l2OrderBook malformed ({describe_error(e)}); pulling quotes")
+            self.pull_quotes()
+            return
         # Reference price: book mid when two-sided, else fall back to the oracle so we
         # can still quote (and bootstrap liquidity) on a one-sided / empty book.
         if best_bid is not None and best_ask is not None:
@@ -443,8 +458,8 @@ def parse_args():
     a.spread = positive_decimal(a.spread, "spread", allow_zero=True)
     if a.spread >= 1:
         raise SystemExit("spread: must be < 1 (a fraction, e.g. 0.03 for 3%).")
-    if a.interval <= 0:
-        raise SystemExit("--interval: must be > 0.")
+    if not math.isfinite(a.interval) or a.interval <= 0:
+        raise SystemExit("--interval: must be a finite value > 0.")
     if a.cycles < 0:
         raise SystemExit("--cycles: must be >= 0.")
     if a.cache_ttl < 1:
@@ -457,7 +472,7 @@ def parse_args():
     return a
 
 
-def fetch_startup_markets(args, attempts=6):
+def fetch_startup_markets(args, attempts=10):
     """Startup /v1/markets with retry + JITTERED backoff. A cold-cache mass launch can make 35
     bots hit the heavy /v1/markets at once and some time out; rather than die on the spot (the
     old call()->SystemExit), retry so the bot rides out the burst -- and likely hits a now-warm
