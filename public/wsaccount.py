@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import sys
+import time
 import urllib.error
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
@@ -31,6 +32,7 @@ LOG_MAX_BYTES   = 2097152
 LOG_BACKUP      = 4
 RECONNECT_BASE  = 1          # seconds; doubles per failure
 RECONNECT_MAX   = 60
+STABLE_AFTER    = 30         # s a connection must STAY UP before backoff resets (else an accept-then-close flap busy-loops)
 OPEN_TIMEOUT    = 10
 PING_INTERVAL   = 20
 PING_TIMEOUT    = 20
@@ -86,6 +88,9 @@ def handle_message(raw, loggers, add_ts):
     except json.JSONDecodeError as e:
         print(f"[parse error] {e} | {raw}")
         return
+    if not isinstance(msg, dict):          # valid JSON but not an object (bare array/number) -> STDOUT, keep reading
+        print(raw)
+        return
 
     logger = loggers.get(msg.get("channel"))
     if logger is None:                        # not a subscribed channel -> stdout
@@ -108,20 +113,27 @@ def _emit(logger, line):
 async def ws_loop(url, subscriptions, loggers, add_ts):
     delay = RECONNECT_BASE
     while True:
+        conn_start = None
         try:
             async with websockets.connect(
                 url, open_timeout=OPEN_TIMEOUT,
                 ping_interval=PING_INTERVAL, ping_timeout=PING_TIMEOUT,
             ) as ws:
-                delay = RECONNECT_BASE          # connected: reset backoff
+                conn_start = time.monotonic()
                 for sub in subscriptions:
                     await ws.send(json.dumps(sub))
                 async for raw in ws:
                     handle_message(raw, loggers, add_ts)
         except Exception as e:
-            print(f"[ws error] {describe_error(e)} — reconnecting in {delay}s", file=sys.stderr)
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, RECONNECT_MAX)
+            print(f"[ws error] {describe_error(e)} — reconnecting", file=sys.stderr)   # actual delay set after the stability reset below
+        # Sleep/backoff ALWAYS (outside the except) so a CLEAN server close (async-for ended, no exception)
+        # also backs off -- previously that path skipped the except entirely and busy-looped at 0 delay.
+        # Reset backoff ONLY if the connection proved STABLE (>= STABLE_AFTER s); resetting on connect
+        # defeated backoff on an accept-then-close flap.
+        if conn_start is not None and (time.monotonic() - conn_start) >= STABLE_AFTER:
+            delay = RECONNECT_BASE
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, RECONNECT_MAX)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
