@@ -282,6 +282,9 @@ def fetch_book(url):
     except json.JSONDecodeError as e:
         print(f"invalid JSON from {url}: {e}")
         return None
+    if not isinstance(data, dict):             # 200 but body isn't a JSON object -> don't crash on .get
+        print(f"unexpected orderbook response shape (not a JSON object) at {url}")
+        return None
     if data.get("ready") is False:             # 200 but explicitly flagged not-ready
         print(f"orderbook not ready yet (ready=false) at {url}")
         return None
