@@ -111,11 +111,16 @@ def main():
 
     # Build the close plan. Sub-step dust (|size| < stepSize) CANNOT be traded -> record it (never a
     # silent skip + exit 0); the final re-query below reports it as still-open and exits nonzero.
-    plan, dust = [], []
+    plan, dust, skipped = [], [], []
     for mid, pos in positions:
         m = by_id.get(str(mid))
         if m is None:
-            raise SystemExit(f"{PROG}: marketId {mid} from positions not found in /v1/markets.")
+            # One market's metadata gap must NOT abort flattening the OTHERS -- a panic-close of N positions
+            # shouldn't leave all N open because one is odd. Skip+record; the residual re-query below finds
+            # it still open -> NOT flat -> exit 1.
+            skipped.append(f"marketId {mid} (not in /v1/markets)")
+            print(f"  skip marketId {mid}: not found in /v1/markets -- NOT closeable", flush=True)
+            continue
         size = dec(pos.get("size"))
         # A MARKET order's protective bound is validated against markPrice (within 10% of mark, per docs).
         # markPrice "0" = no mark received yet; the docs are explicit that callers must NOT substitute
@@ -124,9 +129,13 @@ def main():
         # clearly instead (operator can retry once a mark is available, or close via a limit order).
         mark = dec(m.get("markPrice"))
         if mark is None or mark <= 0:
-            raise SystemExit(f"{PROG}: {m.get('marketDisplayName')} has no markPrice ('0' = no mark received "
-                             f"yet) -- cannot bound a reduce-only MARKET close (the venue validates the bound "
-                             f"against mark; per docs, must not substitute oraclePrice). Re-run when a mark is available.")
+            # No mark yet ('0' = none received) -> can't bound a MARKET close for THIS market. Skip+record
+            # instead of aborting the whole flatten; the residual re-query catches it -> exit 1. (Re-run
+            # when a mark is available, or close it via a limit order. Per docs, must NOT substitute oracle.)
+            skipped.append(f"{m.get('marketDisplayName')} (no markPrice)")
+            print(f"  skip {m.get('marketDisplayName')}: no markPrice ('0' = none received yet) -- can't "
+                  f"bound a reduce-only MARKET close; NOT closeable", flush=True)
+            continue
         tick, step = m["tickSize"], m["stepSize"]
         close_side = "SELL" if size > 0 else "BUY"           # reduce a long by selling, a short by buying
         qty = round_to_increment(abs(size), step, ROUND_FLOOR)
@@ -143,9 +152,10 @@ def main():
                      "side": close_side, "qty": qty, "bound": bound, "mark": mark, "tick": tick, "step": step})
 
     if not plan:
-        # Positions exist but none are closeable (all sub-step dust) -> NOT flat, fail closed.
+        # Positions exist but none are closeable (sub-step dust, and/or markets skipped above) -> NOT flat.
+        notclose = dust + skipped
         print(f"\n  {PROG}: nothing closeable for {address}{scope} [{args.network}]; "
-              f"{len(dust)} sub-step position(s) NOT flat: {', '.join(dust)}\n")
+              f"{len(notclose)} position(s) NOT flat: {', '.join(notclose)}\n")
         raise SystemExit(1)
 
     print(f"\n  {PROG}: flatten {len(plan)} position(s) for {address} [{args.network}]{scope}")
@@ -154,13 +164,15 @@ def main():
               f"(mark {q['mark']:f}, bound {q['bound']:f})")
     if dust:
         print(f"    ({len(dust)} sub-step position(s) NOT closeable: {', '.join(dust)})")
+    if skipped:
+        print(f"    ({len(skipped)} position(s) SKIPPED, NOT closeable: {', '.join(skipped)})")
     print()
 
     ok = fail = 0
+    delta_ns = clock_delta()                                 # server-clock offset: fetch ONCE, not per order
     for q in plan:
         try:
             price, qty_str = f"{q['bound']:f}", f"{q['qty']:f}"
-            delta_ns = clock_delta()
             ct = time.time_ns() + delta_ns                   # server-aligned; also the X-Timestamp
             good_til_us = str((ct // 1000) + GOOD_TIL_DAYS * 86_400 * 1_000_000)
             headers = signer.sign_place_order(
@@ -175,6 +187,8 @@ def main():
                     "goodTilTime": good_til_us, "reduceOnly": True}
             resp = call("POST", "/v1/placeOrder?" + urllib.parse.urlencode({"address": address}), body, headers)
             check_order_response(resp, f"close {q['market']}")   # 2xx body can carry status REJECTED/ERROR
+            if not isinstance(resp, dict):                        # non-object 2xx body -> count as FAIL (before ok++), not both
+                raise SystemExit(f"non-object placeOrder response for {q['market']}: {resp!r}")
             ok += 1
             print(f"  closing {q['market']} -> {q['side']} {qty_str} reduce-only  (orderId {resp.get('orderId', '')})")
         except (Exception, SystemExit) as e:                  # SystemExit = check_order_response reject; never fatal here
@@ -187,7 +201,7 @@ def main():
     time.sleep(SETTLE_SECONDS)
     try:
         residual = [f"{p.get('marketDisplayName')}={p.get('size')}" for _, p in open_positions(address, target_mid)]
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, json.JSONDecodeError, SystemExit) as e:   # call() wraps transport/JSON errors as SystemExit
         print(f"  WARNING could not re-query positions to confirm flat ({describe_error(e)}); "
               f"treating as INCOMPLETE.", file=sys.stderr)
         raise SystemExit(1)
