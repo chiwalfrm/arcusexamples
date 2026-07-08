@@ -27,6 +27,7 @@ so callers can handle them; the CLI entrypoint converts them to clean exits.
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 
@@ -87,15 +88,20 @@ def _identity_match(entry, ident):
 # Cache the client across calls in one process (cheap for CLIs, avoids
 # reconnect/ping per call for any longer-running caller).
 _redis_client = None
-_redis_attempted = False
+_redis_last_fail = 0.0
+_REDIS_RETRY_COOLDOWN = 5.0    # s; retry a DOWN Redis at most this often
 
 
 def _redis():
-    """A live Redis client, or None if Redis isn't reachable (cached per process)."""
-    global _redis_client, _redis_attempted
-    if _redis_attempted:
+    """A live Redis client, or None if Redis isn't reachable. A SUCCESSFUL client is cached; a FAILED
+    connect is NOT memoized permanently -- it is retried every _REDIS_RETRY_COOLDOWN s, so a process that
+    started while Redis was briefly down (or whose Redis restarts) re-establishes the cache instead of
+    skipping it (and hammering the REST API) for its whole lifetime."""
+    global _redis_client, _redis_last_fail
+    if _redis_client is not None:
         return _redis_client
-    _redis_attempted = True
+    if _redis_last_fail and (time.monotonic() - _redis_last_fail) < _REDIS_RETRY_COOLDOWN:
+        return None                                    # recently failed -> back off before retrying
     try:
         import redis
         r = redis.Redis.from_url(REDIS_URL, socket_timeout=0.5, decode_responses=True)
@@ -103,6 +109,7 @@ def _redis():
         _redis_client = r
     except Exception:
         _redis_client = None
+        _redis_last_fail = time.monotonic()
     return _redis_client
 
 
@@ -120,6 +127,8 @@ def _fetch_all(network):
         raise MarketCacheError(f"network error: {e}")
     except json.JSONDecodeError as e:
         raise MarketCacheError(f"invalid JSON from markets API: {e}")
+    if not isinstance(data, dict):
+        raise MarketCacheError("unexpected markets response shape (not a JSON object)")
     markets = data.get("markets")
     if not isinstance(markets, list):
         raise MarketCacheError("unexpected markets response shape (no 'markets' list)")
