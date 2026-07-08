@@ -54,6 +54,10 @@ FAR_FUTURE_US = lambda: str(int(time.time() * 1_000_000) + 365 * 86_400 * 1_000_
 SKEW_THRESHOLD = Decimal("0.5")
 SKEW_MULT = Decimal(2)
 
+# --use-redis-bbo: reject a Redis BBO blob whose liveness `ts` is older than this (s). The wsorderbook
+# publisher heartbeats ~1s, so >3s means the feed/publisher is dead -> fall back to the REST book.
+REDIS_BBO_MAX_AGE = 3.0
+
 RUNNING = True
 
 
@@ -64,6 +68,29 @@ def _stop(_sig, _frame):
 
 def to_inc(value, increment, rounding):
     return (value / increment).to_integral_value(rounding=rounding) * increment
+
+
+def bbo_top_of_book(blob, now, max_age):
+    """(best_bid, best_ask) as Decimals (either may be None for a one-sided/empty book) from a Redis
+    BBO blob, or None if the blob is missing/non-dict, its liveness `ts` is absent/bad, or it's STALE
+    (now - ts > max_age). Pure (no Redis) so it's unit-testable. A FRESH blob is authoritative for the
+    cycle even if one-sided -- the caller then takes the oracle mid, exactly like a one-sided REST book."""
+    if not isinstance(blob, dict):
+        return None
+    try:
+        if now - float(blob.get("ts")) > max_age:
+            return None
+    except (TypeError, ValueError):
+        return None
+    def px(side):
+        lvl = blob.get(side)
+        if not isinstance(lvl, dict):
+            return None
+        try:
+            return Decimal(str(lvl.get("price")))
+        except (InvalidOperation, TypeError):
+            return None
+    return px("bestBid"), px("bestAsk")
 
 
 class MarketMaker:
@@ -85,6 +112,7 @@ class MarketMaker:
         self.net = args.network                  # for the account_cache key namespace
         self.cache_ttl = args.cache_ttl
         self.cache_enabled = not args.no_cache
+        self.use_redis_bbo = args.use_redis_bbo   # read top-of-book from the wsorderbook Redis BBO feed
         # last (price, qty) we believe is RESTING per side -> skip a modify when nothing changed
         self.last_quote = {self.bid_cid: None, self.ask_cid: None}
 
@@ -147,9 +175,19 @@ class MarketMaker:
         cancellation on EXIT remains shutdown()'s job.)"""
         try:
             live = self.live_quotes(fresh=True)   # uncached: a stale cache must not hide a resting GTT quote
-        except (OSError, json.JSONDecodeError) as e:
-            print(f"  could not read open orders to pull quotes: {describe_error(e)}")
+        except (OSError, json.JSONDecodeError, ValueError) as e:   # ValueError = malformed openOrders body
+            # We can't confirm WHICH side rests -- but cancel_quote identifies by clientId (kind:"clientId")
+            # + marketId and needs NO orderId, so best-effort cancel BOTH known sides anyway. A spurious
+            # cancel of a not-resting side just returns a harmless not-found (SystemExit, caught). Returning
+            # WITHOUT trying would leave 365-day GTT quotes resting on any pricing/cache failure -- the exact
+            # thing pull_quotes exists to prevent.
+            print(f"  could not read open orders to pull quotes: {describe_error(e)}; canceling both sides best-effort")
             for cid in (self.bid_cid, self.ask_cid):
+                try:
+                    self.cancel_quote(cid)
+                    print(f"  pulled {cid} (unconfirmed read)")
+                except (OSError, json.JSONDecodeError, SystemExit) as ce:   # not-found / transport -> best-effort
+                    print(f"  pull {cid} failed: {describe_error(ce)}")
                 self.last_quote[cid] = None
             return
         for cid in (self.bid_cid, self.ask_cid):
@@ -172,9 +210,20 @@ class MarketMaker:
         same reason shutdown() confirms cancellation against a fresh read."""
         fetch = lambda: self.call("GET", f"/v1/openOrders?{self.query}")
         src = fetch() if fresh else self._cached("openOrders", self.address, fetch)
+        # A 2xx openOrders body can still be MALFORMED (not a dict, 'orders' not a list, or a non-dict order
+        # entry) -- a poisoned/poller-missed cache or a bad server response. Validate the shape and RAISE on
+        # violation so the caller (cycle / pull_quotes) fails CLOSED and pulls quotes, rather than letting a
+        # bare `.get` AttributeError bubble to run()'s log-only handler and leave 365-day GTT quotes resting.
+        # (Mirrors the l2OrderBook-malformed and position()/free_collateral() fail-closed paths.)
+        if not isinstance(src, dict):
+            raise ValueError(f"openOrders body is {type(src).__name__}, not an object")
         orders = src.get("orders", [])
+        if not isinstance(orders, list):
+            raise ValueError(f"openOrders 'orders' is {type(orders).__name__}, not a list")
         live = {}
         for o in orders:
+            if not isinstance(o, dict):
+                raise ValueError("openOrders contains a non-object order entry")
             cid = o.get("clientId")
             if cid in (self.bid_cid, self.ask_cid) and str(o.get("marketId")) == str(self.market_id):
                 live[cid] = o.get("orderId")
@@ -183,15 +232,22 @@ class MarketMaker:
     def position(self):
         """Signed position size for this market.
 
-        Decimal(0) when genuinely flat (no position), the signed size when
-        parseable, or None when a position EXISTS but its size is unparseable --
-        so the risk guard can fail CLOSED on an unknown position (not treat it as flat).
+        Decimal(0) when genuinely flat, the signed size when parseable, or None when the position can't be
+        determined -- an unparseable size, OR a MALFORMED body (not a dict, or no 'positions' object) -- so the
+        risk guard fails CLOSED (treats it as unknown, never as flat). A body whose 'positions' is PRESENT but
+        null/empty is the API's genuine flat signal (kept). Guards against a bot's OWN unvalidated cache-miss
+        fetch (the poller now rejects malformed bodies before caching, but this is the fetch-side backstop).
         """
-        positions = self._cached("positions", self.address,
-                                 lambda: self.call("GET", f"/v1/positions?{self.query}")).get("positions") or {}
+        body = self._cached("positions", self.address,
+                            lambda: self.call("GET", f"/v1/positions?{self.query}"))
+        if not isinstance(body, dict) or "positions" not in body:
+            return None                        # non-dict / no 'positions' key -> unknown, fail closed
+        positions = body.get("positions") or {}
+        if not isinstance(positions, dict):
+            return None                        # 'positions' present but not an object -> unknown, fail closed
         p = positions.get(str(self.market_id))
         if not p:
-            return Decimal(0)
+            return Decimal(0)                  # 'positions' object present, this market absent -> genuinely flat
         try:
             return Decimal(str(p.get("size")))
         except (InvalidOperation, TypeError):
@@ -201,15 +257,28 @@ class MarketMaker:
         acct = self._cached("account", self.address, lambda: self.call("GET", f"/v1/account?{self.query}"))
         try:
             return Decimal(str(acct.get("freeCollateral")))
-        except (InvalidOperation, TypeError):
+        except (InvalidOperation, TypeError, AttributeError):   # AttributeError = non-dict body -> unknown, fail closed
             return None
 
     def oracle_price(self):
         """Live oracle price for this market (Decimal > 0), or None if unavailable.
         The quoting reference when the book isn't two-sided. One extra /v1/markets
         read, only taken on the fallback path."""
-        markets = self._cached("markets", None, lambda: self.call("GET", "/v1/markets")).get("markets", [])
+        # A 2xx /v1/markets body can be MALFORMED (non-dict body, or 'markets' not a list) -- a poisoned/
+        # poller-missed cache or a bad server response. `.get`/`m.get` on that raises AttributeError, which
+        # the oracle caller in cycle() does NOT catch (only OSError/JSONDecodeError) -> it would bubble to
+        # run()'s log-only handler and leave 365-day GTT quotes resting. Treat malformed as "unavailable":
+        # return None (contract already allows it -> cycle's `if mid is None` pulls quotes). A single non-dict
+        # sibling entry is skipped (it can't be our marketId anyway), not fatal.
+        body = self._cached("markets", None, lambda: self.call("GET", "/v1/markets"))
+        if not isinstance(body, dict):
+            return None
+        markets = body.get("markets", [])
+        if not isinstance(markets, list):
+            return None
         for m in markets:
+            if not isinstance(m, dict):
+                continue
             if str(m.get("marketId")) == str(self.market_id):
                 try:
                     v = Decimal(str(m.get("oraclePrice")))
@@ -249,36 +318,57 @@ class MarketMaker:
                   f"pull BOTH sides every cycle and NO orders will rest -- raise --max-position above "
                   f"{worst:f}, or lower --usd.")
 
-    # ── One cycle ─────────────────────────────────────────────────────────────
-    def cycle(self):
+    def redis_bbo(self):
+        """Top-of-book from the local wsorderbook's Redis BBO feed (--use-redis-bbo), age-guarded on
+        `ts`. (best_bid, best_ask) as Decimals (either may be None), or None when the key is missing/
+        stale/unparseable so the caller falls back to the REST l2OrderBook."""
+        return bbo_top_of_book(account_cache.read_bbo(self.net, self.market), time.time(), REDIS_BBO_MAX_AGE)
+
+    def _top_of_book(self):
+        """(best_bid, best_ask, source) as Decimals|None, or None if no fresh book could be read this
+        cycle (caller pulls quotes). With --use-redis-bbo, prefer the Redis BBO feed and fall back to
+        the REST l2OrderBook when it's stale/missing -- so enabling the flag is never worse than today."""
+        if self.use_redis_bbo:
+            bbo = self.redis_bbo()
+            if bbo is not None:
+                return bbo[0], bbo[1], "redis-book"
+            # stale / missing / down -> fall through to the REST book
         try:
             ob = self.call("GET", f"/v1/l2OrderBook/{urllib.parse.quote(self.market)}")
         except (OSError, json.JSONDecodeError) as e:
             # Can't establish fresh pricing this cycle -> don't leave stale 365-day GTT quotes
             # resting at old prices; pull them and re-quote once the book is readable again.
             print(f"[{time.strftime('%H:%M:%S')}] l2OrderBook unavailable ({describe_error(e)}); pulling quotes")
-            self.pull_quotes()
-            return
-        # Parse/sort the book. A 2xx response can still carry MALFORMED data (non-numeric or
-        # short/wrong-shape levels, or `ob` not even a dict) -> InvalidOperation/TypeError/IndexError/
-        # KeyError/ValueError/AttributeError. Treat that exactly like an unreadable book: FAIL CLOSED
-        # (pull quotes + return) rather than let it bubble to run() (log-only) and leave stale 365-day
-        # GTT quotes resting at old prices.
+            return None
+        # Parse the book. A 2xx response can still carry MALFORMED data (non-numeric or short/wrong-shape
+        # levels, or `ob` not even a dict) -> InvalidOperation/TypeError/IndexError/KeyError/ValueError/
+        # AttributeError. Treat that exactly like an unreadable book: FAIL CLOSED (return None -> caller
+        # pulls quotes) rather than let it bubble to run() (log-only) and leave stale GTT quotes resting.
         try:
             bids, asks = ob.get("bids", []), ob.get("asks", [])
-            # Don't trust server ordering: best bid = highest, best ask = lowest.
-            asks = sorted(asks, key=lambda lv: Decimal(lv[0]))
-            bids = sorted(bids, key=lambda lv: Decimal(lv[0]), reverse=True)
+            # The API server returns each side top-of-book first (bids high→low, asks low→high) and
+            # uncrossed, so bids[0]/asks[0] are already best -- no client-side sort needed (verified live
+            # 2026-07-06 on testnet+mainnet). Same server trust as consuming its prices uncrossed.
             best_bid = Decimal(bids[0][0]) if bids else None
             best_ask = Decimal(asks[0][0]) if asks else None
         except (InvalidOperation, TypeError, IndexError, KeyError, ValueError, AttributeError) as e:
             print(f"[{time.strftime('%H:%M:%S')}] l2OrderBook malformed ({describe_error(e)}); pulling quotes")
+            return None
+        return best_bid, best_ask, "book"
+
+    # ── One cycle ─────────────────────────────────────────────────────────────
+    def cycle(self):
+        # Acquire top-of-book (Redis BBO when --use-redis-bbo, else the REST l2OrderBook). None = no
+        # fresh pricing this cycle -> pull quotes so stale 365-day GTT orders don't rest at old prices.
+        top = self._top_of_book()
+        if top is None:
             self.pull_quotes()
             return
+        best_bid, best_ask, book_src = top
         # Reference price: book mid when two-sided, else fall back to the oracle so we
         # can still quote (and bootstrap liquidity) on a one-sided / empty book.
         if best_bid is not None and best_ask is not None:
-            mid, ref = (best_bid + best_ask) / 2, "book"
+            mid, ref = (best_bid + best_ask) / 2, book_src
         else:
             try:
                 mid = self.oracle_price()      # reads /v1/markets; can raise on transport/JSON error
@@ -297,9 +387,23 @@ class MarketMaker:
         bid_px, ask_px = self.quote_prices(mid)
 
         want_bid, want_ask, notes = True, True, []
+        # A price that rounds to <=0 (market at/near one tick) can't be quoted, and dividing usd/px below would
+        # raise DivisionByZero BEFORE the per-side try -> bubble to run()'s log-only handler and leave stale
+        # quotes resting. Treat a non-positive side as no-quote (mirrors preflight_max_position).
+        if bid_px <= 0:
+            want_bid = False; notes.append("bid-px<=0")
+        if ask_px <= 0:
+            want_ask = False; notes.append("ask-px<=0")
 
-        # Read the position ONCE -- used for both inventory-skew sizing and the guard below.
-        pos = self.position() if self.max_position is not None else None
+        # Read the position ONCE -- used for both inventory-skew sizing and the guard below. A transport/JSON
+        # error here must PULL quotes (fail-closed), not bubble to run()'s log-only handler and leave stale
+        # 365-day GTT quotes resting -- matching the pricing path above. (A parseable-but-unknown position
+        # already returns None -> handled fail-closed by the guard below.)
+        try:
+            pos = self.position() if self.max_position is not None else None
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[{time.strftime('%H:%M:%S')}] position read failed ({describe_error(e)}); pulling quotes")
+            self.pull_quotes(); return
 
         # Inventory skew: past SKEW_THRESHOLD * max_position, quote the REDUCING side SKEW_MULT x
         # larger (growing side stays normal) so inventory mean-reverts toward flat faster.
@@ -310,8 +414,8 @@ class MarketMaker:
                 ask_usd = self.usd * SKEW_MULT; notes.append(f"skew-ask-{SKEW_MULT}x")
             elif pos <= -skew_at:                      # short at/beyond threshold -> grow the BUY side
                 bid_usd = self.usd * SKEW_MULT; notes.append(f"skew-bid-{SKEW_MULT}x")
-        bid_qty = to_inc(bid_usd / bid_px, self.step, ROUND_FLOOR)
-        ask_qty = to_inc(ask_usd / ask_px, self.step, ROUND_FLOOR)
+        bid_qty = to_inc(bid_usd / bid_px, self.step, ROUND_FLOOR) if bid_px > 0 else Decimal(0)
+        ask_qty = to_inc(ask_usd / ask_px, self.step, ROUND_FLOOR) if ask_px > 0 else Decimal(0)
 
         # Inventory guard (fail-closed): account for the PENDING quote size -- a
         # bid fill takes position to pos+bid_qty, an ask fill to pos-ask_qty -- so
@@ -328,7 +432,11 @@ class MarketMaker:
         # Collateral guard (fail-closed): pull both quotes when free collateral is
         # low OR unknown (missing/unparseable).
         if self.min_collateral is not None:
-            fc = self.free_collateral()
+            try:
+                fc = self.free_collateral()
+            except (OSError, json.JSONDecodeError) as e:
+                print(f"[{time.strftime('%H:%M:%S')}] collateral read failed ({describe_error(e)}); pulling quotes")
+                self.pull_quotes(); return
             if fc is None:
                 want_bid = want_ask = False; notes.append("collateral-unknown")
             elif fc < self.min_collateral:
@@ -346,7 +454,11 @@ class MarketMaker:
         if ask_qty <= 0:
             want_ask = False
 
-        live = self.live_quotes()
+        try:
+            live = self.live_quotes()
+        except (OSError, json.JSONDecodeError, ValueError) as e:   # ValueError = malformed openOrders body
+            print(f"[{time.strftime('%H:%M:%S')}] openOrders read failed ({describe_error(e)}); pulling quotes")
+            self.pull_quotes(); return
         actions = []
         for cid, oside, sside, px, qty, want in (
             (self.bid_cid, "BUY", ordersign.SIDE_BUY, bid_px, bid_qty, want_bid),
@@ -414,11 +526,16 @@ class MarketMaker:
                     print(f"  {cid}: cancel error: {describe_error(e)}")    # the fresh openOrders read below is the source of truth
             # Confirm via a FRESH read (NOT the cache -- it could be stale and falsely show gone).
             try:
-                orders = self.call("GET", f"/v1/openOrders?{self.query}").get("orders", [])
+                body = self.call("GET", f"/v1/openOrders?{self.query}")
+                if not isinstance(body, dict):
+                    raise ValueError(f"openOrders body is {type(body).__name__}, not an object")
+                orders = body.get("orders", [])
+                if not isinstance(orders, list) or not all(isinstance(o, dict) for o in orders):
+                    raise ValueError("openOrders 'orders' is not a list of objects")
                 remaining = [o.get("clientId") for o in orders
                              if o.get("clientId") in (self.bid_cid, self.ask_cid)
                              and str(o.get("marketId")) == str(self.market_id)]
-            except (OSError, json.JSONDecodeError) as e:
+            except (OSError, json.JSONDecodeError, ValueError) as e:   # ValueError = malformed openOrders body
                 print(f"  could not confirm cancellation (openOrders read failed: {describe_error(e)})")
                 remaining = None
                 continue
@@ -451,6 +568,11 @@ def parse_args():
                         "default 5. Must be < --interval. See account_cache.py / account_poller.py")
     p.add_argument("--no-cache", action="store_true",
                    help="bypass the Redis account cache; fetch every account-wide read live")
+    p.add_argument("--use-redis-bbo", action="store_true",
+                   help="derive best bid/ask from the local wsorderbook's Redis BBO feed "
+                        "(arcus:<net>:bbo:<market>, age-guarded on ts) instead of a per-cycle REST "
+                        "/v1/l2OrderBook; falls back to REST when the feed is stale/missing. Requires a "
+                        "wsorderbook publishing BBO for this market.")
     add_network_args(p)
     a = p.parse_args()
 
@@ -511,6 +633,9 @@ def main():
           + (f"  max-pos={mm.max_position} (skew {SKEW_MULT}x reducing side at |pos|>={SKEW_THRESHOLD * mm.max_position})"
              if mm.max_position is not None else "")
           + (f"  min-collat={mm.min_collateral}" if mm.min_collateral is not None else ""))
+    if mm.use_redis_bbo:
+        print(f"  price source: Redis BBO 'arcus:{mm.net}:bbo:{mm.market}' "
+              f"(age-guard {REDIS_BBO_MAX_AGE}s) → REST /v1/l2OrderBook fallback")
 
     mm.preflight_max_position()
 
