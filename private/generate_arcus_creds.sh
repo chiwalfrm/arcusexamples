@@ -202,7 +202,9 @@ case "$answer" in
       rm -f "$TMP"; echo "Failed to write creds -- nothing written."; exit 1
     fi
     chmod 600 "$TMP" 2>/dev/null            # re-assert 0600 (mktemp already does this)
-    mv -f "$TMP" "$OUT"
+    if ! mv -f "$TMP" "$OUT"; then
+      rm -f "$TMP"; echo "Failed to move creds into place -- nothing written."; exit 1
+    fi
     chmod 600 "$OUT" 2>/dev/null            # belt-and-suspenders for a cross-filesystem mv
     echo "Wrote $OUT (mode 600)."
     ;;
