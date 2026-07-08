@@ -26,6 +26,12 @@ sys.path.insert(0, _HERE)
 import account_cache
 from arcus_common import add_network_args, describe_error, load_creds, request, select_network
 
+# Minimum shape each endpoint must have to be worth caching: the top-level key the bots actually read. A 2xx with
+# a malformed body (e.g. {} or {"error":...}) that lacks this key must NOT be cached -- bots would read it as
+# authoritative (e.g. positions -> {} -> "flat" on an OPEN position = fail-OPEN fleet-wide). On an invalid shape
+# we skip the write and let the key expire, so bots self-refresh (or keep using the last-good value until its TTL).
+_REQUIRED_KEY = {"openOrders": "orders", "positions": "positions", "account": "freeCollateral", "markets": "markets"}
+
 
 def main():
     p = argparse.ArgumentParser(description="Keep Arcus account-wide reads warm in Redis for the market_maker fleet.")
@@ -80,6 +86,9 @@ def main():
             for name, addr, path in endpoints:
                 try:
                     data = request("GET", path)
+                    if not (isinstance(data, dict) and _REQUIRED_KEY[name] in data):
+                        errs.append(f"{name}:malformed-body(no '{_REQUIRED_KEY[name]}')")
+                        continue          # don't cache a shape that would mislead a bot; let it expire
                     if account_cache.write(a.network, addr, name, data, a.ttl):
                         ok += 1
                         warmed.add(name)
