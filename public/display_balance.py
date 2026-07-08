@@ -48,19 +48,27 @@ def count_positions(positions):
     return len(positions) if isinstance(positions, (dict, list)) else 0
 
 
+def require_dict(data, what):
+    """A decoded JSON body that must be an object -> raise a clean CLI error if the server returned
+    null / a list / a scalar instead (so the .get(...) callers can't AttributeError)."""
+    if not isinstance(data, dict):
+        raise SystemExit(f"display_balance: unexpected {what} response shape (not a JSON object)")
+    return data
+
+
 def fetch_account(address):
     """GET /v1/account, turning network/HTTP/JSON failures into clean CLI errors."""
     query = urllib.parse.urlencode({"address": address})
     req = urllib.request.Request(f"{BASE}/v1/account?{query}", method="GET")
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read() or b"{}")
+            return require_dict(json.loads(r.read() or b"{}"), "account")
     except urllib.error.HTTPError as e:
         # 404 = address valid but never traded/deposited; 400 = bad address.
         # The JSON body carries the human-readable reason, so surface it.
         try:
             msg = json.loads(e.read() or b"{}").get("error", "")
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, AttributeError):   # AttributeError = non-dict error body
             msg = ""
         if e.code == 404:
             raise SystemExit(f"No activity yet for {address} "
