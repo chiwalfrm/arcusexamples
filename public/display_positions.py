@@ -106,6 +106,8 @@ def fetch_positions(address):
     except json.JSONDecodeError as e:
         raise SystemExit(f"display_positions: invalid JSON from server: {e}")
 
+    if not isinstance(data, dict):          # a non-object 200 body would crash data.get below
+        raise SystemExit("display_positions: unexpected response (expected a JSON object).")
     positions = data.get("positions")
     if positions is None:
         return {}
@@ -139,7 +141,8 @@ def main():
     if args.header and not args.condensed:
         raise SystemExit("display_positions: --header requires --condensed.")
 
-    positions = sorted(fetch_positions(args.address).values(), key=market_id_key)
+    positions = sorted((p for p in fetch_positions(args.address).values() if isinstance(p, dict)),
+                       key=market_id_key)   # drop any null/non-dict position value defensively
 
     if args.condensed:
         # Raw signed quantity straight from the API, CSV-escaped for downstream scripts.
