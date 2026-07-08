@@ -90,17 +90,25 @@ def partially_filled(order):
     return 0 < remaining < size
 
 
+def require_dict(data, what):
+    """A decoded JSON body that must be an object -> raise a clean CLI error if the server returned
+    null / a list / a scalar instead (so the .get(...) below can't AttributeError)."""
+    if not isinstance(data, dict):
+        raise SystemExit(f"display_orders: unexpected {what} response shape (not a JSON object)")
+    return data
+
+
 def fetch_orders(address, limit):
     """GET /v1/orders, turning network/HTTP/JSON failures into clean CLI errors."""
     query = urllib.parse.urlencode({"address": address, "limit": limit})
     req = urllib.request.Request(f"{BASE}/v1/orders?{query}", method="GET")
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read() or b"{}").get("orders", [])
+            return require_dict(json.loads(r.read() or b"{}"), "orders").get("orders") or []
     except urllib.error.HTTPError as e:
         try:
             msg = json.loads(e.read() or b"{}").get("error", "")
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, AttributeError):   # AttributeError = non-dict error body
             msg = ""
         raise SystemExit(f"HTTP {e.code}: {msg or 'request failed'}")
     except urllib.error.URLError as e:
