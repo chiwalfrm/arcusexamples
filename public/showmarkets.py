@@ -60,6 +60,14 @@ def market_id_key(m):
         return (1, 0)
 
 
+def require_dict(data, what):
+    """A decoded JSON body that must be an object -> clean CLI error if the server returned null /
+    a list / a scalar instead (so the .get(...) below can't AttributeError)."""
+    if not isinstance(data, dict):
+        raise SystemExit(f"showmarkets: unexpected {what} response shape (not a JSON object)")
+    return data
+
+
 def fetch_markets(cache_path=None):
     """Fetch and sort markets, turning network/parse failures into clean CLI errors. When cache_path
     is set, the RAW response is also written there (best-effort) to warm the launcher's shared cache
@@ -76,7 +84,7 @@ def fetch_markets(cache_path=None):
     except json.JSONDecodeError as e:
         raise SystemExit(f"showmarkets: invalid JSON from server: {e}")
 
-    markets = data.get("markets")
+    markets = require_dict(data, "markets").get("markets")
     if not isinstance(markets, list):
         raise SystemExit("showmarkets: unexpected response shape (no 'markets' list).")
     if cache_path is not None:
@@ -153,4 +161,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        # A downstream reader closed early (e.g. `... | head`). Point stdout at devnull so the interpreter's
+        # shutdown flush can't re-raise BrokenPipeError, then exit cleanly -- this tool is meant for piping.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except Exception:
+            pass
+        sys.exit(0)
