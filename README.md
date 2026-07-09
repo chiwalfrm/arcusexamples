@@ -2,6 +2,8 @@ Recommended OS: Ubuntu 24.04.4 LTS server
 
 Onboarding guide: https://x.com/LawrenceChiu14/status/2074904236454809808
 
+Note: Arcus API keys can only place trades, they can't withdraw or transfer funds
+
 **Required Packages**
 - python3-pip, python3-venv (to install pip3 packages)
 - redis (caches data) [OPTIONAL]
