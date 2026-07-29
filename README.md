@@ -14,6 +14,9 @@ Note: Arcus API keys can only place trades, they can't withdraw or transfer fund
 - cryptography
 - redis [OPTIONAL]
 
+**Configuration**
+- Create directory /mnt/arcuslogs (with u+rwx permissions).  Logs go here.
+
 **Documentation**
 - private-commands-docs.txt - Documentation for the private/ commands
 - public-commands-docs.txt - Documentation for the public/ commands
