@@ -5,6 +5,7 @@ Display funding payments for an account, newest-first.
   python3 display_funding.py <eth_address> --market BTC-USD      # only that market
   python3 display_funding.py <eth_address> --from 1782000000000  # walk older history
   python3 display_funding.py <eth_address> --limit 50 --condensed
+  python3 display_funding.py <eth_address> --limit unlimited      # full history (bypasses 30-day default)
 
 Uses GET /v1/funding (per-account funding payment history). This is a public, account-scoped
 read -- it takes only the `address` query parameter and needs NO signature, so this display
@@ -17,58 +18,25 @@ Output is sorted newest-first locally (not trusting API ordering).
 
 import argparse
 import csv
-import json
+import os
 import re
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
+from functools import partial
+from arcus_common_public import NETWORKS, UNLIMITED, dec, epoch_ms_arg, get_json_dict, limit_arg, page_pace_delay, resolve_market_id, when   # shared public helpers (formerly local copies)
 
-NETWORKS = {
-    "testnet": "https://api.testnet.arcus.xyz",
-    "staging": "https://api.staging.arcus.xyz",
-    "mainnet": "https://api.arcus.xyz",       # live 2026-06-25 (reads only for now)
-}
+_get_json = partial(get_json_dict, prog="display_funding")   # get_json + require_dict, this tool's prog
+
+
 BASE = None   # set in main() from the required --testnet/--staging/--mainnet selector
 ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+PAGE_SIZE = 1000          # API max per request; page size used by --limit unlimited
 
 # Fields emitted by --condensed (raw, one CSV row per payment; no header, per the display_* convention).
 CONDENSED_KEYS = ["time", "marketDisplayName", "fundingRate", "size", "payment"]
-
-
-def limit_arg(s):
-    """argparse type: an integer in [1, 1000] (the API's max)."""
-    v = int(s)
-    if not 1 <= v <= 1000:
-        raise argparse.ArgumentTypeError("must be between 1 and 1000")
-    return v
-
-
-def epoch_ms_arg(s):
-    """argparse type: a non-negative epoch-milliseconds integer."""
-    v = int(s)
-    if v < 0:
-        raise argparse.ArgumentTypeError("must be a non-negative epoch-ms timestamp")
-    return v
-
-
-def when(micros):
-    """Epoch MICROseconds -> 'YYYY-MM-DD HH:MM:SS' UTC, or '-' if absent/invalid.
-
-    NB the Arcus API mixes units (verified live + docs): RESPONSE timestamps -- this `time`
-    field -- are epoch microseconds ("user-facing timestamps are now microseconds"), while the
-    REQUEST filters --from/--to are epoch MILLISECONDS. So divide by 1e6 here; pass --from/--to
-    through as-is. A real value 1782583200000000 -> 2026-06-27 (µs); /1e3 would be year 58457.
-    """
-    if micros is None or micros == "":
-        return "-"
-    try:
-        return datetime.fromtimestamp(int(micros) / 1_000_000, timezone.utc) \
-            .strftime("%Y-%m-%d %H:%M:%S")
-    except (ValueError, TypeError, OverflowError, OSError):
-        return "-"
 
 
 def time_key(payment):
@@ -77,51 +45,6 @@ def time_key(payment):
         return int(payment.get("time"))
     except (TypeError, ValueError):
         return -1
-
-
-def dec(v):
-    """Parse a decimal string -> Decimal, or None if absent/invalid/non-finite."""
-    try:
-        d = Decimal(str(v))
-    except (InvalidOperation, TypeError, ValueError):
-        return None
-    return d if d.is_finite() else None
-
-
-def _get_json(url, what):
-    """GET url -> parsed JSON object, turning network/HTTP/JSON failures into clean CLI errors."""
-    req = urllib.request.Request(url, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.loads(r.read() or b"{}")
-    except urllib.error.HTTPError as e:
-        try:
-            msg = json.loads(e.read() or b"{}").get("error", "")
-        except (ValueError, TypeError):
-            msg = ""
-        raise SystemExit(f"HTTP {e.code}: {msg or 'request failed'}")
-    except urllib.error.URLError as e:
-        raise SystemExit(f"display_funding: could not reach {BASE}: {e.reason}")
-    except (TimeoutError, OSError) as e:
-        raise SystemExit(f"display_funding: network error fetching {what}: {e}")
-    except json.JSONDecodeError as e:
-        raise SystemExit(f"display_funding: invalid JSON from {what}: {e}")
-    if not isinstance(data, dict):
-        raise SystemExit(f"display_funding: unexpected {what} response (expected a JSON object).")
-    return data
-
-
-def resolve_market_id(market):
-    """Resolve --market (display name case-insensitive OR numeric marketId) to a canonical marketId
-    string via GET /v1/markets. FAILS on an unknown market -- a typo must not silently show 0 rows."""
-    markets = _get_json(f"{BASE}/v1/markets", "markets").get("markets")
-    if not isinstance(markets, list):
-        raise SystemExit("display_funding: unexpected /v1/markets response (no 'markets' list).")
-    for m in markets:
-        if (str(market).upper() == str(m.get("marketDisplayName", "")).upper()
-                or str(market) == str(m.get("marketId"))):
-            return str(m.get("marketId"))
-    raise SystemExit(f"display_funding: unknown market {market!r} (not found in /v1/markets).")
 
 
 def fetch_funding(address, limit, from_ms=None, to_ms=None):
@@ -137,7 +60,65 @@ def fetch_funding(address, limit, from_ms=None, to_ms=None):
         return []
     if not isinstance(payments, list):
         raise SystemExit("display_funding: unexpected /v1/funding response ('fundingPayments' is not a list).")
-    return payments
+    return [p for p in payments if isinstance(p, dict)]   # drop any non-dict element so downstream .get() can't crash
+
+
+def iter_funding_pages(address, from_ms=None, to_ms=None):
+    """--limit unlimited, as a GENERATOR: yield each page's FRESH (deduped) payments LIST, newest-first, as it
+    pages BACKWARD via the `to` cursor -- so a caller can STREAM output instead of buffering the whole history
+    first. /v1/funding has only from/to bounds and DEFAULTS to the last 30 days when `from` is omitted, so we
+    send from=0 (unless --from) to reach genuine full history. `time` is MICROseconds but `to` is MILLIseconds,
+    so the cursor is ceil(oldest_time_us / 1000): rounding UP keeps `to` inclusive of the boundary row so no
+    payment is skipped, and dedup by (marketDisplayName, time) drops the re-read. fetch_funding_all() flattens."""
+    seen = set()
+    eff_from = from_ms if from_ms is not None else 0
+    cursor = to_ms
+    first = True
+    while True:
+        q = {"address": address, "limit": PAGE_SIZE, "from": eff_from}
+        if cursor is not None:
+            q["to"] = cursor
+        # Pace pages AFTER the first: a full 1000-row /v1/funding page costs ~70 IP-weight and the per-IP
+        # bucket refills 25/s, so unpaced back-to-back paging drives the bucket negative -> 429. The first
+        # page rides the already-full bucket (no pause).
+        data = _get_json(f"{BASE}/v1/funding?{urllib.parse.urlencode(q)}", "funding",
+                         delay=(0.0 if first else page_pace_delay()))
+        first = False
+        payments = data.get("fundingPayments")
+        if payments is None:
+            break
+        if not isinstance(payments, list):
+            raise SystemExit("display_funding: unexpected /v1/funding response ('fundingPayments' is not a list).")
+        if not payments:
+            break
+        fresh = []
+        for p in payments:
+            if not isinstance(p, dict):        # skip a malformed non-dict element
+                continue
+            key = (p.get("marketDisplayName"), p.get("time"))
+            if key in seen:
+                continue
+            seen.add(key)
+            fresh.append(p)
+        if fresh:
+            yield fresh                     # STREAM this page's fresh payments before fetching the next
+        if len(payments) < PAGE_SIZE:      # fewer than a full page -> reached the oldest / `from`
+            break
+        if not fresh:                       # no new rows -> stop, never loop
+            break
+        positives = [c for c in (time_key(p) for p in payments if isinstance(p, dict)) if c > 0]
+        if not positives:                   # nothing with a usable timestamp to advance the cursor
+            break
+        nc = (min(positives) + 999) // 1000        # ceil us -> ms, inclusive of the boundary row
+        if cursor is not None and nc >= cursor:    # cursor didn't decrease -> avoid an infinite loop
+            break
+        cursor = nc
+
+
+def fetch_funding_all(address, from_ms=None, to_ms=None):
+    """--limit unlimited: page /v1/funding to completeness, COLLECTED into one list (for the table path, which
+    needs the full set for column widths + the totals footer). Streaming callers use iter_funding_pages()."""
+    return [p for page in iter_funding_pages(address, from_ms, to_ms) for p in page]
 
 
 def print_table(payments, address, label, note):
@@ -174,15 +155,18 @@ def main():
     parser.add_argument("address", help="Ethereum address of the account to display")
     parser.add_argument("--market",
                         help="show only payments in this market (display name or marketId; default: all)")
-    parser.add_argument("--limit", type=limit_arg, default=1000,
-                        help="max payments to fetch, 1-1000 (default/max 1000)")
+    parser.add_argument("--limit", type=limit_arg, default=1000, metavar="N",
+                        help="max payments to fetch: 1-1000 (default/max 1000), or 'unlimited' to page "
+                             "the FULL history backward (sends from=0 to bypass the 30-day default; "
+                             "honors --from/--to)")
     # NB --from/--to are epoch MILLISECONDS (API request-filter unit), even though the response
     # `time` field is microseconds -- this asymmetry is the Arcus API's, not a bug here (see when()).
     parser.add_argument("--from", dest="from_ms", type=epoch_ms_arg, metavar="EPOCH_MS",
-                        help="only payments at/after this start time (epoch ms, inclusive); "
+                        help="only payments at/after this start time (epoch MILLIseconds, inclusive -- NB "
+                             "/v1/funding takes ms, unlike display_fills/display_transfers which take µs); "
                              "omit and the API defaults to the last 30 days")
     parser.add_argument("--to", dest="to_ms", type=epoch_ms_arg, metavar="EPOCH_MS",
-                        help="only payments at/before this end time (epoch ms, inclusive; default: now)")
+                        help="only payments at/before this end time (epoch MILLIseconds, inclusive; default: now)")
     parser.add_argument("--condensed", action="store_true",
                         help="machine-readable: one CSV row per payment "
                              "(time,market,fundingRate,size,payment), raw values, no header/padding/totals")
@@ -208,27 +192,42 @@ def main():
 
     # Validate/resolve --market up front (a typo must FAIL, not silently return 0 rows). The funding
     # API has no server-side market filter, so we filter locally by the canonical marketId.
-    target_mid = resolve_market_id(args.market) if args.market else None
+    target_mid = resolve_market_id(BASE, args.market, "display_funding") if args.market else None
 
-    raw = fetch_funding(args.address, args.limit, args.from_ms, args.to_ms)
-    truncated = len(raw) >= args.limit            # a full page back -> older payments may exist
-    payments = [p for p in raw if target_mid is None or str(p.get("marketId")) == target_mid]
-    payments.sort(key=time_key, reverse=True)      # enforce newest-first locally
-
+    # --condensed is a machine-readable firehose (usually piped): STREAM each page as it pages in (newest-first
+    # via the backward walk) so a huge account starts printing immediately + shows steady progress instead of
+    # buffering the whole history first (and `| head` can stop it early). No global re-sort in stream mode --
+    # the pagination order IS newest-first; a consumer needing a strict order sorts its own copy.
     if args.condensed:
         writer = csv.writer(sys.stdout, lineterminator="\n")
         if args.header:
             writer.writerow(CONDENSED_KEYS)
-        for p in payments:
-            writer.writerow([p.get(k, "") for k in CONDENSED_KEYS])
+        pages = (iter_funding_pages(args.address, args.from_ms, args.to_ms) if args.limit == UNLIMITED
+                 else [fetch_funding(args.address, args.limit, args.from_ms, args.to_ms)])
+        for page in pages:
+            for p in page:
+                if target_mid is not None and str(p.get("marketId")) != target_mid:
+                    continue
+                writer.writerow([p.get(k, "") for k in CONDENSED_KEYS])
+            sys.stdout.flush()        # push each page so output is visible as it pages, even without `python -u`
         return
+
+    # Human table: needs the FULL set (column widths + totals footer), so it collects then sorts -- can't stream.
+    if args.limit == UNLIMITED:
+        raw = fetch_funding_all(args.address, args.from_ms, args.to_ms)
+        truncated = False                         # paginated to completeness (within --from/--to)
+    else:
+        raw = fetch_funding(args.address, args.limit, args.from_ms, args.to_ms)
+        truncated = len(raw) >= args.limit        # a full page back -> older payments may exist
+    payments = [p for p in raw if target_mid is None or str(p.get("marketId")) == target_mid]
+    payments.sort(key=time_key, reverse=True)      # enforce newest-first locally
 
     label = args.market.upper() if args.market else "ALL"
     # Be honest about scope: the default window is only the last 30 days, and --market filters only
     # WITHIN the fetched (possibly truncated) page.
     notes = []
-    if args.from_ms is None:
-        notes.append("default window: last 30 days -- pass --from (epoch ms) for older history")
+    if args.from_ms is None and args.limit != UNLIMITED:
+        notes.append("default window: last 30 days -- pass --from (epoch ms) or --limit unlimited for older history")
     if truncated:
         if target_mid is not None:
             notes.append(f"latest {args.limit} payments scanned; older {label} payments may exist")
@@ -242,4 +241,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        # A downstream reader closed early (e.g. `... | head`). Point stdout at devnull so the interpreter's
+        # shutdown flush can't re-raise BrokenPipeError, then exit cleanly -- this tool is meant for piping.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except Exception:
+            pass
+        sys.exit(0)
