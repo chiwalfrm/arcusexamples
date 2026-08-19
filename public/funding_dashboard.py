@@ -33,24 +33,40 @@ as a full 1h/8h/24h number. A missing/unparseable fundingRate is a hard error, n
 The footer's "Backoffs" is the number of retry-sleeps incurred; a high count means you're being
 rate-limited, so raise --delay. "Hidden" is how many default-funding rows were suppressed;
 "Partial" is how many shown rows have an incomplete 24h window (marked *).
+
+Exit status (so cron/automation can tell clean from degraded from broken):
+  0  every ONLINE market fetched OK (or no ONLINE markets at all -- nothing to do)
+  1  PARTIAL -- some markets fetched, at least one failed (still a useful dashboard)
+  2  TOTAL failure -- markets existed but every one failed (broken API/auth; not a real dashboard)
+Failed markets are always named on stderr and counted in the footer's "Failed: N", any exit code.
 """
 
 import argparse
 import html
-import json
 import math
+import os
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
+from arcus_common_public import NETWORKS, dec, get_json as _cpub_get_json   # shared public helpers (formerly local copies)
 
-NETWORKS = {
-    "testnet": "https://api.testnet.arcus.xyz",
-    "staging": "https://api.staging.arcus.xyz",
-    "mainnet": "https://api.arcus.xyz",       # live 2026-06-25 (reads only for now)
-}
+
+def _bump_backoffs():
+    """on_retry hook for get_json: count each transient backoff into the footer's BACKOFFS stat."""
+    global BACKOFFS
+    BACKOFFS += 1
+
+
+def get_json(url, what, delay):
+    """Arcus GET for the whole-universe funding sweep -- delegates to the shared reader with this
+    tool's policy: retries=4, a 15s timeout, the politeness PRE-delay, and counting each backoff into
+    BACKOFFS (footer stat, to help tune --delay)."""
+    return _cpub_get_json(url, what=what, prog="funding_dashboard", delay=delay, retries=4, timeout=15,
+                          on_retry=_bump_backoffs)
+
 BASE = None   # set in main() from the required --testnet/--staging/--mainnet selector
 BACKOFFS = 0  # count of retry backoffs (429/transient) across all requests; reported in the footer
 
@@ -116,66 +132,25 @@ def ansi_paint(text, idx):
     return f"\x1b[48;2;{br};{bgc};{bb}m\x1b[38;2;{fr};{fgc};{fb}m{text}\x1b[0m"
 
 
-def dec(value):
-    """Parse a decimal string -> Decimal, or None if absent/invalid/non-finite."""
-    try:
-        d = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
-        return None
-    return d if d.is_finite() else None
-
-
 def is_default_funding(sums, hourly):
     """True if every window sum equals n * hourly exactly -- i.e. funding sat at the default
     across the whole trailing window, so the row carries no information."""
     return all(sums[n] == hourly * n for n in WINDOWS)
 
 
-def get_json(url, what, delay, retries=4):
-    """GET url -> parsed JSON, with retry+backoff on transient failures.
-
-    A 429/5xx or a network/timeout error is retried (exponential backoff); a 4xx
-    other than 429, or exhausted retries, becomes a clean SystemExit. `delay` is a
-    politeness pause applied before the request so a whole-universe sweep doesn't
-    hammer the rate limit. Each retry-sleep bumps the module BACKOFFS counter
-    (reported in the footer, to help tune --delay).
-    """
-    global BACKOFFS
-    if delay:
-        time.sleep(delay)
-    last = None
-    for attempt in range(retries):
-        try:
-            req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req, timeout=15) as r:
-                return json.loads(r.read() or b"{}")
-        except urllib.error.HTTPError as e:
-            last = f"HTTP {e.code}"
-            if e.code != 429 and e.code < 500:
-                # A permanent client error (bad market etc.) -- don't retry.
-                try:
-                    msg = json.loads(e.read() or b"{}").get("error", "")
-                except (ValueError, TypeError):
-                    msg = ""
-                raise SystemExit(f"funding_dashboard: {what}: HTTP {e.code}: {msg or 'request failed'}")
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            last = str(e)
-        except json.JSONDecodeError as e:
-            last = f"bad JSON: {e}"
-        # transient -> back off and retry
-        if attempt < retries - 1:
-            BACKOFFS += 1
-            time.sleep(min(2 ** attempt, 8))
-    raise SystemExit(f"funding_dashboard: {what}: failed after {retries} attempts ({last}).")
-
-
 def fetch_online_markets(delay):
     """GET /v1/markets -> list of ONLINE market dicts, sorted by baseAsset ticker."""
     data = get_json(f"{BASE}/v1/markets", "markets", delay)
+    if not isinstance(data, dict):     # non-object 2xx (bare array/string/null) -> clean exit, not AttributeError on .get
+        raise SystemExit(f"funding_dashboard: unexpected /v1/markets response (not a JSON object, got {type(data).__name__}).")
     markets = data.get("markets")
     if not isinstance(markets, list):
-        raise SystemExit("funding_dashboard: unexpected /v1/markets response (no 'markets' list).")
-    online = [m for m in markets if str(m.get("status")) == "ONLINE"]
+        raise SystemExit("funding_dashboard: unexpected /v1/markets response ('markets' missing or not a list).")
+    # Require a non-empty marketDisplayName too: it's the per-market funding lookup key downstream, so a None/
+    # blank one would only surface as a noisier per-market failure later -- skip it up front (skip non-dict junk too).
+    online = [m for m in markets
+              if isinstance(m, dict) and str(m.get("status")) == "ONLINE"
+              and isinstance(m.get("marketDisplayName"), str) and m["marketDisplayName"].strip()]
     return sorted(online, key=lambda m: str(m.get("baseAsset", m.get("marketDisplayName", ""))).upper())
 
 
@@ -193,9 +168,14 @@ def window_sums(market_display, delay):
     """
     q = urllib.parse.urlencode({"market": market_display, "limit": max(WINDOWS)})
     data = get_json(f"{BASE}/v1/fundingRates?{q}", f"fundingRates {market_display}", delay)
+    if not isinstance(data, dict):     # non-object 2xx -> clean per-market failure, not AttributeError on .get
+        raise SystemExit(f"funding_dashboard: {market_display}: unexpected /v1/fundingRates response "
+                         f"(not a JSON object, got {type(data).__name__}).")
     rates = data.get("fundingRates")
     if not isinstance(rates, list):
         raise SystemExit(f"funding_dashboard: unexpected /v1/fundingRates response for {market_display}.")
+    if not all(isinstance(r, dict) for r in rates):    # a non-dict row would AttributeError in tkey/the loop below
+        raise SystemExit(f"funding_dashboard: {market_display}: non-object row in /v1/fundingRates response.")
 
     def tkey(r):
         try:
@@ -304,14 +284,28 @@ def main():
 
     rows = []
     hidden = 0
+    failed = []                      # (ticker, reason) for markets we couldn't fetch/parse -> surfaced, never silent
     for m in markets:
         display = m.get("marketDisplayName")
         ticker = str(m.get("baseAsset") or str(display).split("-")[0])
-        sums, points = window_sums(display, args.delay)
+        # Per-market isolation: one bad market (fetch error, 429-retry exhaustion, malformed/missing
+        # fundingRate) must NOT abort the whole universe scan -- an ops dashboard should still show every
+        # OTHER market. Record the failure (surfaced in the footer + detailed on stderr) and continue.
+        try:
+            sums, points = window_sums(display, args.delay)
+        except (SystemExit, Exception) as e:   # window_sums/get_json signal per-market failure via SystemExit
+            failed.append((ticker, str(e.code) if isinstance(e, SystemExit) else f"{type(e).__name__}: {e}"))
+            continue
         if not args.all and is_default_funding(sums, DEFAULT_HOURLY):
             hidden += 1
             continue
         rows.append((ticker, sums, points))
+
+    # Surface skipped markets on STDERR so stdout stays clean (pipeable text / --html fragment).
+    if failed:
+        print(f"funding_dashboard: {len(failed)} market(s) skipped (fetch/parse failed):", file=sys.stderr)
+        for tk, reason in failed:
+            print(f"  - {tk}: {reason}", file=sys.stderr)
 
     # UTC generation time (matches the shell `date` look) + wall-clock runtime, plus operational counts.
     runtime = round(time.time() - start)
@@ -319,7 +313,7 @@ def main():
     stamp = time.strftime("%a %b %e %I:%M:%S %p", g) + " UTC " + time.strftime("%Y", g)
     partial = sum(1 for _, _, p in rows if p < max(WINDOWS))   # rows with an incomplete 24h window
     footer = (f"Generated: {stamp} / Runtime {runtime} seconds / Backoffs: {BACKOFFS} "
-              f"/ Hidden: {hidden} at default funding / Partial: {partial} marked *")
+              f"/ Hidden: {hidden} at default funding / Failed: {len(failed)} / Partial: {partial} marked *")
 
     if args.html:
         render_html(rows, footer)
@@ -327,6 +321,25 @@ def main():
         use_color = args.color == "always" or (args.color == "auto" and sys.stdout.isatty())
         render_text(rows, footer, use_color)
 
+    # Escalating exit status so cron/automation can distinguish clean / degraded / broken without parsing
+    # stdout (failed markets are still listed on stderr + the footer regardless):
+    #   0 = every market succeeded (or an empty ONLINE universe -- nothing to fetch, not a failure)
+    #   1 = PARTIAL -- at least one market succeeded and at least one failed (degraded but useful dashboard)
+    #   2 = TOTAL failure -- markets existed but every one failed (API/auth broken; empty dashboard != success)
+    if markets and len(failed) == len(markets):
+        raise SystemExit(2)
+    if failed:
+        raise SystemExit(1)
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        # A downstream reader closed early (e.g. `... | head`). Point stdout at devnull so the interpreter's
+        # shutdown flush can't re-raise BrokenPipeError, then exit cleanly -- this tool is meant for piping.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except Exception:
+            pass
+        sys.exit(0)
