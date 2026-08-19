@@ -2,7 +2,7 @@
 """OPTIONAL poller: keep Arcus account-wide REST reads warm in Redis so a fleet of per-market
 market_maker bots never has to fetch them itself (rate limits). Polls openOrders / positions /
 account for the given address + the exchange-wide markets list, writing each to the SAME cache
-the bots read (account_cache.py), with a TTL LONGER than the poll interval -- so while this runs
+the bots read (arcus_redis.py, imported as account_cache), with a TTL LONGER than the poll interval -- so while this runs
 the keys never expire, the bots always get cache hits, and they stop fetching those endpoints
 entirely. One process does the N account-wide fetches per poll instead of every bot doing them.
 
@@ -12,9 +12,10 @@ entirely. One process does the N account-wide fetches per poll instead of every 
 Account-scoped Arcus reads are UNSIGNED, so this signs nothing and uses no API keys -- it just
 reads eth_address from arcus_creds_<network>.json (the bots' account) to know what to warm. If
 it's NOT running, the bots fall back to their own short-TTL cache-aside refresh (no harm).
-Run it with `python3 -u` so the log streams. Ctrl-C to stop. stdlib + redis only.
+Run it with `python3 -u` so the log streams. Ctrl-C to stop. stdlib + redis (plus cryptography via the shared arcus helpers).
 """
 import argparse
+import math
 import os
 import sys
 import time
@@ -23,27 +24,39 @@ import urllib.parse
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
-import account_cache
-from arcus_common import add_network_args, describe_error, load_creds, request, select_network
+import arcus_redis as account_cache
+from arcus_common_private import add_network_args, describe_error, load_creds, request, retry_after_seconds, select_network
 
-# Minimum shape each endpoint must have to be worth caching: the top-level key the bots actually read. A 2xx with
-# a malformed body (e.g. {} or {"error":...}) that lacks this key must NOT be cached -- bots would read it as
-# authoritative (e.g. positions -> {} -> "flat" on an OPEN position = fail-OPEN fleet-wide). On an invalid shape
-# we skip the write and let the key expire, so bots self-refresh (or keep using the last-good value until its TTL).
-_REQUIRED_KEY = {"openOrders": "orders", "positions": "positions", "account": "freeCollateral", "markets": "markets"}
+# The "worth caching" shape rule (dict + required top-level key per endpoint) lives in arcus_redis (imported as account_cache) as the
+# SINGLE source of truth shared with the bots' cache-aside writes (account_cache.is_cacheable / REQUIRED_KEYS),
+# so both writers refuse the same malformed 2xx bodies. On an invalid shape we skip the write and let the key
+# expire, so bots self-refresh (or keep using the last-good value until its TTL).
 
 
 def main():
     p = argparse.ArgumentParser(description="Keep Arcus account-wide reads warm in Redis for the market_maker fleet.")
     p.add_argument("--interval", type=float, default=4, help="seconds between polls (default 4)")
-    p.add_argument("--ttl", type=int, default=12,
-                   help="Redis TTL for the cached blobs (s); MUST be > --interval so keys stay warm (default 12)")
+    p.add_argument("--ttl", type=int, default=30,
+                   help="Redis TTL for the cached blobs (s); MUST be > --interval so keys stay warm. Give it "
+                        "SEVERAL polls of headroom (>= ~4x --interval): if a rate-limit burst makes a couple of "
+                        "polls fail in a row, a short TTL lets every key expire at once and the whole bot fleet "
+                        "cache-misses and re-fetches together (a thundering herd that feeds the 429 storm). A "
+                        "longer TTL rides out the burst on the last-good value instead (default 30)")
     add_network_args(p)
     a = p.parse_args()
-    if a.interval <= 0:
-        raise SystemExit("account_poller: --interval must be > 0.")
+    # `type=float` accepts "nan"/"inf"/"-inf", and `nan <= 0` is False (every NaN comparison is), so a bare
+    # `<= 0` guard lets --interval nan through -> it then poisons the ttl cross-checks (all False) and reaches
+    # time.sleep(). Require a FINITE positive interval. (--ttl is type=int, so int("nan") already fails cleanly.)
+    if not math.isfinite(a.interval) or a.interval <= 0:
+        raise SystemExit("account_poller: --interval must be a finite number > 0.")
     if a.ttl <= a.interval:
         raise SystemExit("account_poller: --ttl must be > --interval (so keys stay warm between polls).")
+    if a.ttl < a.interval * 4:
+        # Not fatal, but thin: a 429 burst that skips >=(ttl/interval - 1) consecutive polls expires the keys
+        # and stampedes the fleet onto live fetches. Warn so the operator can widen the margin.
+        print(f"account_poller: WARNING --ttl {a.ttl}s is only {a.ttl / a.interval:.1f}x --interval {a.interval}s; "
+              f"a rate-limit burst lasting a few polls will expire the warm keys and stampede the fleet. "
+              f"Consider --ttl >= {int(a.interval * 4)}.", flush=True)
     select_network(a.network)
     a.address = load_creds()["eth_address"]   # always the bots' creds account (this is their helper)
 
@@ -70,7 +83,9 @@ def main():
     cur_day = time.strftime("%Y-%m-%d")
     try:
         while True:
-            ts = time.strftime("%H:%M:%S")
+            # "[HH:MM:SS <epoch>]" -- the trailing integer epoch (unix seconds) makes showlogs.sh's
+            # time window exact and date-proof (no wall-clock reconstruction). Human time kept up front.
+            ts = f"{time.strftime('%H:%M:%S')} {int(time.time())}"
             # MEASURE expire-before-refresh: a key we already warmed that is GONE (ttl == -2) at the
             # top of this cycle lapsed since its last write -> bots would have cache-missed it. ttl is
             # None when Redis is down (a separate, write-failure condition) -> don't count that as a gap.
@@ -83,11 +98,12 @@ def main():
                           f"{gaps_total[name]} total", flush=True)
 
             ok, errs = 0, []
+            backoff = 0.0   # honor the largest Retry-After seen this poll (429 from the app OR Cloudflare 1015)
             for name, addr, path in endpoints:
                 try:
                     data = request("GET", path)
-                    if not (isinstance(data, dict) and _REQUIRED_KEY[name] in data):
-                        errs.append(f"{name}:malformed-body(no '{_REQUIRED_KEY[name]}')")
+                    if not account_cache.is_cacheable(name, data):
+                        errs.append(f"{name}:malformed-body('{account_cache.REQUIRED_KEYS[name]}' missing or wrong shape)")
                         continue          # don't cache a shape that would mislead a bot; let it expire
                     if account_cache.write(a.network, addr, name, data, a.ttl):
                         ok += 1
@@ -95,6 +111,9 @@ def main():
                     else:
                         errs.append(f"{name}:redis-write-failed")
                 except (OSError, ValueError) as e:
+                    ra = retry_after_seconds(e)   # header-only read; safe to call before describe_error(e)
+                    if ra is not None:
+                        backoff = max(backoff, ra)
                     errs.append(f"{name}:{describe_error(e)}")
                 except Exception as e:
                     errs.append(f"{name}:{e}")
@@ -116,7 +135,11 @@ def main():
                       f"(cache gaps {sum(gaps_today.values())} today, {sum(gaps_total.values())} total)",
                       flush=True)
                 last_hb = now
-            time.sleep(a.interval)
+            # On a 429 sleep AT LEAST the venue's Retry-After (else we'd hammer straight back into the limit
+            # every --interval and prolong the throttle); otherwise the normal cadence.
+            if backoff > a.interval:
+                print(f"[{ts}] rate limited; backing off {backoff:g}s before next poll (Retry-After)", flush=True)
+            time.sleep(max(a.interval, backoff))
     except KeyboardInterrupt:
         run_summary = ", ".join(f"{n}={gaps_total[n]}" for n, _, _ in endpoints)
         print(f"\naccount_poller: stopped. Cache-gap totals this run: {run_summary} "
