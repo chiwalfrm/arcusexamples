@@ -15,21 +15,14 @@ newest-first locally too (not trusting API ordering).
 
 import argparse
 import csv
-import json
+import os
 import re
 import sys
-import urllib.error
 import urllib.parse
-import urllib.request
-from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from arcus_common_public import NETWORKS, created_key, get_json_dict, when   # shared public helpers (formerly local copies)
 
-NETWORKS = {
-    "testnet": "https://api.testnet.arcus.xyz",
-    "staging": "https://api.staging.arcus.xyz",
-    "mainnet": "https://api.arcus.xyz",       # live 2026-06-25 (reads only for now)
-}
-BASE = None   # set in main() from the required --testnet/--staging selector
+BASE = None   # set in main() from the required --testnet/--staging/--mainnet selector
 ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 # Status values the venue can report, per the order schema.
@@ -56,25 +49,6 @@ def limit_arg(s):
     return v
 
 
-def when(micros):
-    """Epoch microseconds -> 'YYYY-MM-DD HH:MM:SS' UTC, or '-' if absent/invalid."""
-    if micros is None or micros == "":
-        return "-"
-    try:
-        return datetime.fromtimestamp(int(micros) / 1_000_000, timezone.utc) \
-            .strftime("%Y-%m-%d %H:%M:%S")
-    except (ValueError, TypeError, OverflowError, OSError):
-        return "-"
-
-
-def created_key(order):
-    """Sort key by createdAt (desc via reverse=True); missing/bad sorts oldest."""
-    try:
-        return int(order.get("createdAt"))
-    except (TypeError, ValueError):
-        return -1
-
-
 def partially_filled(order):
     """True when some -- but not all -- of the order has filled.
 
@@ -85,38 +59,28 @@ def partially_filled(order):
     try:
         remaining = Decimal(str(order.get("remainingSize")))
         size = Decimal(str(order.get("originalSize")))
+        if not (remaining.is_finite() and size.is_finite()):   # Decimal(str("NaN")) constructs fine, but the ordered
+            return False                                        # compare below RAISES InvalidOperation on a NaN -> crash
+        return 0 < remaining < size
     except (InvalidOperation, TypeError, ValueError):
         return False
-    return 0 < remaining < size
-
-
-def require_dict(data, what):
-    """A decoded JSON body that must be an object -> raise a clean CLI error if the server returned
-    null / a list / a scalar instead (so the .get(...) below can't AttributeError)."""
-    if not isinstance(data, dict):
-        raise SystemExit(f"display_orders: unexpected {what} response shape (not a JSON object)")
-    return data
 
 
 def fetch_orders(address, limit):
     """GET /v1/orders, turning network/HTTP/JSON failures into clean CLI errors."""
     query = urllib.parse.urlencode({"address": address, "limit": limit})
-    req = urllib.request.Request(f"{BASE}/v1/orders?{query}", method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return require_dict(json.loads(r.read() or b"{}"), "orders").get("orders") or []
-    except urllib.error.HTTPError as e:
-        try:
-            msg = json.loads(e.read() or b"{}").get("error", "")
-        except (ValueError, TypeError, AttributeError):   # AttributeError = non-dict error body
-            msg = ""
-        raise SystemExit(f"HTTP {e.code}: {msg or 'request failed'}")
-    except urllib.error.URLError as e:
-        raise SystemExit(f"display_orders: could not reach {BASE}: {e.reason}")
-    except (TimeoutError, OSError) as e:
-        raise SystemExit(f"display_orders: network error: {e}")
-    except json.JSONDecodeError as e:
-        raise SystemExit(f"display_orders: invalid JSON from server: {e}")
+    # Shared retrying reader: Retry-After/backoff on 429 (incl. Cloudflare 1015) + 5xx, clean CLI errors,
+    # require_dict included -- so this tool is no longer fragile under a rate-limit burst in cron/ops.
+    body = get_json_dict(f"{BASE}/v1/orders?{query}", "orders", "display_orders")
+    # Validate the shape (mirrors display_fills/funding): a MISSING 'orders' key is "no orders" -> [],
+    # but a PRESENT-but-non-list value (dict/str/number) must be a clean error, not fall through `or []`
+    # (truthy non-lists slip past that) and crash the downstream sort/comprehension with AttributeError.
+    orders = body.get("orders")
+    if orders is None:
+        return []
+    if not isinstance(orders, list):
+        raise SystemExit("display_orders: unexpected /v1/orders response ('orders' is not a list).")
+    return [o for o in orders if isinstance(o, dict)]   # drop non-dict elements so downstream .get()/sort-key can't crash
 
 
 def print_table(orders, address, label):
@@ -207,4 +171,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        # A downstream reader closed early (e.g. `... | head`). Point stdout at devnull so the interpreter's
+        # shutdown flush can't re-raise BrokenPipeError, then exit cleanly -- this tool is meant for piping.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except Exception:
+            pass
+        sys.exit(0)
