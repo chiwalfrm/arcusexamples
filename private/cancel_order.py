@@ -29,9 +29,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
 from ordersign import Signer
-import arcus_common
-from arcus_common import (add_network_args, call, check_order_response, load_creds,
-                          select_network, validate_client_id)
+import arcus_common_private
+from arcus_common_private import (add_network_args, call, check_order_response, fetch_open_orders, load_creds,
+                          select_network, server_clock_shim, validate_client_id)
 
 
 def parse_args():
@@ -57,16 +57,19 @@ def parse_args():
 
 
 def cancel_all(address, account_index, signer, query):
-    print(f"Cancelling ALL open orders for {address} at {arcus_common.BASE}.")
+    print(f"Cancelling ALL open orders for {address} at {arcus_common_private.BASE}.")
     body = {"address": address, "accountIndex": account_index}
-    headers = signer.sign_legacy("/v1/cancelAllOrders", body)   # legacy scheme
+    with server_clock_shim():                                   # server-align the X-Timestamp so a drifted clock can't 401 the panic cancel
+        headers = signer.sign_legacy("/v1/cancelAllOrders", body)   # legacy scheme
     resp = call("POST", f"/v1/cancelAllOrders?{query}", body, headers)
     print("Cancel-all response:", json.dumps(resp, indent=2))
     check_order_response(resp, "cancelAllOrders")
 
 
 def cancel_one(args, address, account_index, signer, query):
-    orders = call("GET", f"/v1/openOrders?{query}").get("orders", [])
+    # FAIL CLOSED on an unreadable openOrders body (non-dict / missing / non-list 'orders'): order state is
+    # UNKNOWN, so we must not read it as "no matching order" (a resting order could be missed) or traceback.
+    orders = fetch_open_orders(query, "cancel_order")
     if args.orderid:
         cands = [o for o in orders if o.get("orderId") == args.orderid]
         ident_desc = f"orderId {args.orderid}"
@@ -96,15 +99,18 @@ def cancel_one(args, address, account_index, signer, query):
     except (KeyError, ValueError, TypeError):
         raise SystemExit(f"matched order has no valid marketId: {match.get('marketId')!r}.")
 
-    # Identify the cancel by whichever was given (typed payload op=2).
+    # Identify the cancel by whichever was given (typed payload op=2). Wrap the sign in the clock shim so a
+    # drifted local clock can't push the X-Timestamp outside the server's +/-30 s auth window -> 401.
     if args.orderid:
-        headers = signer.sign_cancel_order(address=address, account_index=account_index,
-                                           market_id=market_id, order_id=args.orderid)
+        with server_clock_shim():
+            headers = signer.sign_cancel_order(address=address, account_index=account_index,
+                                               market_id=market_id, order_id=args.orderid)
         body = {"address": address, "accountIndex": account_index,
                 "marketId": market_id, "kind": "orderId", "orderId": args.orderid}
     else:
-        headers = signer.sign_cancel_order(address=address, account_index=account_index,
-                                           market_id=market_id, client_id=args.clientid)
+        with server_clock_shim():
+            headers = signer.sign_cancel_order(address=address, account_index=account_index,
+                                               market_id=market_id, client_id=args.clientid)
         body = {"address": address, "accountIndex": account_index,
                 "marketId": market_id, "kind": "clientId", "clientId": args.clientid}
 
