@@ -15,32 +15,14 @@ All monetary values are full quote-currency (USDC) decimal strings:
 """
 
 import argparse
-import json
+import os
 import re
-import urllib.error
+import sys
 import urllib.parse
-import urllib.request
-from decimal import Decimal, InvalidOperation
+from arcus_common_public import NETWORKS, get_json, num, require_dict   # shared public helpers (formerly local copies)
 
-NETWORKS = {
-    "testnet": "https://api.testnet.arcus.xyz",
-    "staging": "https://api.staging.arcus.xyz",
-    "mainnet": "https://api.arcus.xyz",       # live 2026-06-25 (reads only for now)
-}
-BASE = None   # set in main() from the required --testnet/--staging selector
+BASE = None   # set in main() from the required --testnet/--staging/--mainnet selector
 ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
-
-
-def num(value, decimals=2):
-    """Decimal-string -> fixed-precision, comma-grouped; '-' if not numeric.
-
-    Uses Decimal (not float) since the API returns decimal strings for money --
-    avoids binary floating-point rounding surprises.
-    """
-    try:
-        return f"{Decimal(str(value)):,.{decimals}f}"
-    except (InvalidOperation, TypeError, ValueError):
-        return "-"
 
 
 def count_positions(positions):
@@ -48,38 +30,16 @@ def count_positions(positions):
     return len(positions) if isinstance(positions, (dict, list)) else 0
 
 
-def require_dict(data, what):
-    """A decoded JSON body that must be an object -> raise a clean CLI error if the server returned
-    null / a list / a scalar instead (so the .get(...) callers can't AttributeError)."""
-    if not isinstance(data, dict):
-        raise SystemExit(f"display_balance: unexpected {what} response shape (not a JSON object)")
-    return data
-
-
 def fetch_account(address):
     """GET /v1/account, turning network/HTTP/JSON failures into clean CLI errors."""
     query = urllib.parse.urlencode({"address": address})
-    req = urllib.request.Request(f"{BASE}/v1/account?{query}", method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return require_dict(json.loads(r.read() or b"{}"), "account")
-    except urllib.error.HTTPError as e:
-        # 404 = address valid but never traded/deposited; 400 = bad address.
-        # The JSON body carries the human-readable reason, so surface it.
-        try:
-            msg = json.loads(e.read() or b"{}").get("error", "")
-        except (ValueError, TypeError, AttributeError):   # AttributeError = non-dict error body
-            msg = ""
-        if e.code == 404:
-            raise SystemExit(f"No activity yet for {address} "
-                             f"(account has never been touched).")
-        raise SystemExit(f"HTTP {e.code}: {msg or 'request failed'}")
-    except urllib.error.URLError as e:
-        raise SystemExit(f"display_balance: could not reach {BASE}: {e.reason}")
-    except (TimeoutError, OSError) as e:
-        raise SystemExit(f"display_balance: network error: {e}")
-    except json.JSONDecodeError as e:
-        raise SystemExit(f"display_balance: invalid JSON from server: {e}")
+    # Shared retrying reader (Retry-After/backoff on 429 incl. Cloudflare 1015 + 5xx). none_on_404: a 404 means
+    # the address is valid but never traded/deposited -> friendly message rather than a raw HTTP error. A bad
+    # address (400) and other non-429 4xx still raise SystemExit with the API's own error body, inside get_json.
+    data = get_json(f"{BASE}/v1/account?{query}", what="account", prog="display_balance", none_on_404=True)
+    if data is None:
+        raise SystemExit(f"No activity yet for {address} (account has never been touched).")
+    return require_dict(data, "account", "display_balance")
 
 
 def main():
@@ -143,4 +103,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        # A downstream reader closed early (e.g. `... | head`). Point stdout at devnull so the interpreter's
+        # shutdown flush can't re-raise BrokenPipeError, then exit cleanly -- this tool is meant for piping.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except Exception:
+            pass
+        sys.exit(0)
