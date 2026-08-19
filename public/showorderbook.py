@@ -1,69 +1,50 @@
 #!/usr/bin/env python3
 import sys
 import os
+import math
 import time
 import json
 import argparse
 import urllib.error
 import urllib.request
+from arcus_common_public import NETWORKS, markets_cache_path, positive_int, read_markets_cache, write_markets_cache   # shared public helpers (formerly local copies)
 
 # ── Constants ────────────────────────────────────────────────────────────────
-NETWORKS = {
-    "testnet": "https://api.testnet.arcus.xyz",
-    "staging": "https://api.staging.arcus.xyz",
-    "mainnet": "https://api.arcus.xyz",       # live 2026-06-25 (reads only for now)
-}
 MARKETS_URL = None   # set in main() from the required --testnet/--staging/--mainnet selector
 MARKETS_CACHE = None
 # Must match wsorderbook.py: HTTP port = PORT_BASE[network] + marketId.
 PORT_BASE = {"mainnet": 10000, "testnet": 11000, "staging": 12000}
+MAX_MARKET_ID = 999   # PORT_BASE entries are 1000 apart, so a marketId >= 1000 would push the port into
+                      # the NEXT network's band (mainnet 10xxx / testnet 11xxx / staging 12xxx) -> wrong
+                      # server. No wsorderbook port exists for such an id (mirrors dydxv4 MAX_CLOB_PAIR_ID).
 # Launcher handoff cache written by showmarkets.py --createjson; read fail-open so this tool still
 # works standalone when the file is absent. The launcher exports ARCUS_MARKETS_CACHE with a per-run
 # path (so a foreign/stale file can't be trusted); we fall back to this NETWORK-scoped predictable
 # path for manual use (testnet/staging/mainnet marketId maps differ). See wsorderbook.py for details.
-MARKETS_CACHE_FMT = "/tmp/arcus_markets_{network}.json"
-
-
-def _read_markets_cache(path):
-    """Return a parsed /v1/markets response from the launcher's shared cache file, or None.
-    Fail-open: any problem (missing / unreadable / corrupt / wrong shape) returns None so the caller
-    does a live fetch. Only a payload whose 'markets' is a list is trusted."""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if isinstance(data, dict) and isinstance(data.get("markets"), list):
-        return data
-    return None
-
-
-def _write_markets_cache(path, data):
-    """Best-effort ATOMIC write (temp + os.replace, so a reader never sees a partial file) to warm
-    the launcher's shared cache. Never raises: a cache-write failure must not break a working tool."""
-    tmp = f"{path}.{os.getpid()}.tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        os.replace(tmp, path)
-    except OSError:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
 
 
 # ── Market ID lookup ──────────────────────────────────────────────────────────
 def fetch_market_id(market: str) -> int:
     """Resolve a market to its numeric marketId.
 
-    Accepts a numeric marketId directly, or a display name matched
-    case-insensitively. Network/parse/not-found failures become clean CLI
+    Accepts a numeric marketId or a case-insensitively-matched display name, but
+    EITHER WAY the market must exist in /v1/markets AND its id must fit the port
+    band (0..MAX_MARKET_ID). A digit-only id that isn't a real market is a clean
+    "not found" -- previously it was returned as-is without checking, yielding a
+    wrong port (PORT_BASE + id) and a confusing "server not responding". An id
+    beyond the band is a clean "out of range" (its port would collide with the
+    next network's server). Network/parse/not-found failures become clean CLI
     errors rather than tracebacks.
     """
-    if market.isdigit():
-        return int(market)
-    data = _read_markets_cache(MARKETS_CACHE)
+    numeric = market.isdigit() and market.isascii()   # isascii guard: exotic Unicode digits (², ⑤) pass
+    if numeric:                                        # isdigit() but int() would raise -> treat as a name
+        want_id = int(market)
+        if not (0 <= want_id <= MAX_MARKET_ID):   # no valid port (incl. a negative id) -> reject before fetching markets
+            raise SystemExit(f"showorderbook: marketId {want_id} out of range (0-{MAX_MARKET_ID}); "
+                             "no wsorderbook port exists for it.")
+    else:
+        want_id = None
+    data = read_markets_cache(MARKETS_CACHE)
     if data is None:                        # cache miss -> live fetch, then warm the cache
         try:
             with urllib.request.urlopen(MARKETS_URL, timeout=10) as r:
@@ -76,11 +57,26 @@ def fetch_market_id(market: str) -> int:
             raise SystemExit(f"showorderbook: network error: {e}")
         except json.JSONDecodeError as e:
             raise SystemExit(f"showorderbook: invalid JSON from markets API: {e}")
-        _write_markets_cache(MARKETS_CACHE, data)
+        # Validate the live body BEFORE using/caching it: the cache reader already trusts only a dict
+        # with a list 'markets', but this fetch path did not -- a non-dict body would AttributeError on
+        # data.get() below (and cache junk). Fail clean, matching read_markets_cache's trust rule.
+        if not isinstance(data, dict):
+            raise SystemExit(f"showorderbook: unexpected /v1/markets response (not a JSON object, got "
+                             f"{type(data).__name__}).")
+        if not isinstance(data.get("markets"), list):
+            raise SystemExit("showorderbook: unexpected /v1/markets response ('markets' missing or not a list).")
+        write_markets_cache(MARKETS_CACHE, data)
     target = market.upper()
     for m in data.get("markets", []):
-        if str(m.get("marketDisplayName", "")).upper() == target:
-            return int(m["marketId"])
+        try:
+            mid = int(m["marketId"])
+        except (KeyError, ValueError, TypeError):
+            continue                        # skip a malformed entry rather than crash on int()
+        if (numeric and mid == want_id) or (not numeric and str(m.get("marketDisplayName", "")).upper() == target):
+            if not (0 <= mid <= MAX_MARKET_ID):   # a REAL market whose id is out of band (incl. NEGATIVE -> PORT_BASE+neg
+                raise SystemExit(f"showorderbook: market '{market}' has marketId {mid} out of range "   # = wrong/foreign port)
+                                 f"(0-{MAX_MARKET_ID}); no wsorderbook port exists for it.")
+            return mid
     raise SystemExit(f"showorderbook: market '{market}' not found.")
 
 # ── Crossed-price resolution ──────────────────────────────────────────────────
@@ -91,6 +87,28 @@ def _seq(entry):
         return float(entry[2])
     except (IndexError, ValueError, TypeError):
         return 0.0
+
+
+def clean_levels(levels):
+    """Drop rows that would traceback in the float() sort/crossed/display below: a usable level must be
+    subscriptable with a numeric, FINITE price (lv[0]) and size (lv[1]). Short arrays, non-subscriptable rows,
+    and non-numeric/NaN/Inf price|size are removed -- so a mangled feed or a foreign --server can't crash the
+    tool, and a NaN can't poison the sort order or the spread%. Returns (clean_rows, dropped_count)."""
+    clean, dropped = [], 0
+    for lv in levels:
+        try:
+            p, s = float(lv[0]), float(lv[1])
+        except (IndexError, KeyError, TypeError, ValueError):
+            dropped += 1
+            continue
+        if not (math.isfinite(p) and math.isfinite(s)):
+            dropped += 1
+            continue
+        # Normalize price/size to STRINGS: a NUMERIC price/size (a foreign --server / non-string feed) survives
+        # the float() check above but crashes display's split_num (`"." in <float>` -> TypeError). clean_levels'
+        # contract is "surviving rows won't traceback in display", so coerce here (str of a str is a no-op).
+        clean.append([str(lv[0]), str(lv[1]), *lv[2:]])
+    return clean, dropped
 
 
 def resolve_crosses(bids: list, asks: list):
@@ -110,7 +128,8 @@ def display(market: str, bids: list, asks: list, crossed=None, usd: bool = False
     crossed = crossed or []   # avoid mutable-default-arg footgun
 
     def split_num(s):
-        if "." in s:
+        s = str(s)                     # defensive: a numeric price/size would TypeError on `"." in s` (clean_levels
+        if "." in s:                   # normalizes, but any other caller stays safe too)
             i, d = s.split(".", 1)
             return i, "." + d
         return s, ""
@@ -180,8 +199,10 @@ def display(market: str, bids: list, asks: list, crossed=None, usd: bool = False
         best_ask   = float(asks[0][0])
         spread     = best_ask - best_bid
         midpoint   = (best_bid + best_ask) / 2
-        spread_pct = (spread / midpoint) * 100
-        spread_str = f"  Spread: {spread:.1f} ({spread_pct:.2f}%)"
+        if midpoint:                            # a 0 (or -0) midpoint from a 0-price book would ZeroDivisionError
+            spread_str = f"  Spread: {spread:.1f} ({(spread / midpoint) * 100:.2f}%)"
+        else:
+            spread_str = f"  Spread: {spread:.1f} (pct n/a: midpoint 0)"
     else:
         spread_str = ""
 
@@ -226,14 +247,6 @@ def display(market: str, bids: list, asks: list, crossed=None, usd: bool = False
     print()
 
 # ── Entry point ───────────────────────────────────────────────────────────────
-def positive_int(s):
-    """argparse type: a positive integer (rejects 0 and negatives)."""
-    v = int(s)
-    if v <= 0:
-        raise argparse.ArgumentTypeError("must be a positive integer")
-    return v
-
-
 def check_server(url):
     """Verify the orderbook HTTP server is responding, then exit.
 
@@ -288,6 +301,12 @@ def fetch_book(url):
     if data.get("ready") is False:             # 200 but explicitly flagged not-ready
         print(f"orderbook not ready yet (ready=false) at {url}")
         return None
+    # bids/asks must be LISTS before main() does .sort() on them. data.get("bids", []) does NOT protect
+    # against "bids": null (present-but-None returns None, not the default) or a non-list -> .sort() would
+    # AttributeError. Treat a malformed shape as not-usable (clean message + retry/exit), like the checks above.
+    if not isinstance(data.get("bids"), list) or not isinstance(data.get("asks"), list):
+        print(f"unexpected orderbook response shape (bids/asks missing or not lists) at {url}")
+        return None
     return data
 
 
@@ -309,7 +328,7 @@ def main():
                      help="resolve the market against the mainnet server")
     args = parser.parse_args()
     MARKETS_URL = NETWORKS[args.network] + "/v1/markets"
-    MARKETS_CACHE = os.environ.get("ARCUS_MARKETS_CACHE") or MARKETS_CACHE_FMT.format(network=args.network)
+    MARKETS_CACHE = markets_cache_path(args.network)
 
     market = args.market
     host   = args.server
@@ -332,6 +351,14 @@ def main():
         bids = data.get("bids", [])
         asks = data.get("asks", [])
 
+        # Row-level hardening: drop any malformed level (short array, non-subscriptable, non-numeric/NaN/Inf
+        # price or size) BEFORE the float() sort/crossed/display below, so a mangled feed or a foreign --server
+        # can't traceback the tool. (fetch_book already guaranteed bids/asks are LISTS; this validates ROWS.)
+        bids, bdrop = clean_levels(bids)
+        asks, adrop = clean_levels(asks)
+        if bdrop or adrop:
+            print(f"  note: dropped {bdrop} malformed bid + {adrop} malformed ask level(s)")
+
         bids.sort(key=lambda x: float(x[0]), reverse=True)
         asks.sort(key=lambda x: float(x[0]))
 
@@ -352,4 +379,13 @@ def main():
         time.sleep(1)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        # A downstream reader closed early (e.g. `... | head`). Point stdout at devnull so the interpreter's
+        # shutdown flush can't re-raise BrokenPipeError, then exit cleanly -- this tool is meant for piping.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except Exception:
+            pass
+        sys.exit(0)
