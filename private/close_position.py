@@ -24,12 +24,11 @@ import time
 import urllib.parse
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # resolve ordersign/arcus_common beside this file
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # resolve ordersign/arcus_common_private beside this file
 import ordersign
 from ordersign import Signer
-from arcus_common import (add_network_args, call, check_order_response, clock_delta_ns,
-                          dec, describe_error, load_creds, positive_decimal, resolve_market,
-                          select_network, to_quantums, to_ticks)
+from arcus_common_private import (
+    add_network_args, call, check_order_response, clamp_to_mark_cap, clock_delta, dec, describe_error, load_creds, positive_decimal, resolve_market, round_to_increment, select_network, to_quantums, to_ticks)
 
 PROG = "close_position"
 GOOD_TIL_DAYS = 365         # venue requires goodTilTime >= 1 month even on IOC; 365d clears it
@@ -37,42 +36,47 @@ SETTLE_SECONDS = 2          # let IOC fills settle before the residual re-query
 SIDES = {"BUY": ordersign.SIDE_BUY, "SELL": ordersign.SIDE_SELL}
 
 
-def clock_delta():
-    """Server-minus-local clock offset (ns) from /v1/time; 0 (local clock) if unavailable."""
-    try:
-        return clock_delta_ns()
-    except Exception as e:
-        print(f"warning: /v1/time unavailable ({describe_error(e)}); using local clock.", file=sys.stderr)
-        return 0
-
-
-def round_to_increment(value, increment, rounding):
-    inc = Decimal(increment)
-    return (value / inc).to_integral_value(rounding=rounding) * inc
-
-
 def fetch_positions(address):
-    """GET /v1/positions -> {marketIdStr: posdict} (empty object if none)."""
+    """GET /v1/positions -> {marketIdStr: posdict}. FAIL CLOSED (SystemExit) on an unreadable body: a non-dict
+    response, or a MISSING/null/non-dict `positions` field, means exposure is UNKNOWN -- a PANIC-close must NOT
+    read that as flat (exit 0), nor `.get` on a non-dict body (traceback). The venue returns an explicit `{}`
+    for genuinely no positions, so ONLY a dict (incl empty {}) is trusted."""
     data = call("GET", "/v1/positions?" + urllib.parse.urlencode({"address": address}))
-    positions = data.get("positions")
-    if positions is None:
-        return {}
+    positions = data.get("positions") if isinstance(data, dict) else None
     if not isinstance(positions, dict):
-        raise SystemExit(f"{PROG}: unexpected /v1/positions shape (expected object).")
+        raise SystemExit(f"{PROG}: positions unreadable -- /v1/positions did not return an object with a "
+                         f"'positions' object (exposure UNKNOWN; NOT treating as flat). Retry.")
     return positions
 
 
 def open_positions(address, target_mid):
-    """Non-zero positions as [(marketIdStr, posdict)]; if target_mid is set, only that marketId."""
-    out = []
+    """Return (open, unknown). `open` = parseable NON-ZERO positions [(marketIdStr, posdict)]. `unknown` =
+    descriptions of IN-SCOPE positions whose exposure CANNOT be determined -- a non-dict value, or a
+    missing/non-finite/unparseable `size` (dec() rejects "NaN"/"Infinity"/junk). This is a PANIC-CLOSE
+    (get-out button): an UNKNOWN position is NOT flat, so the caller must report it and exit nonzero rather
+    than claim success on unreadable state -- treating malformed position state as flat would falsely tell
+    the operator they have no exposure. Only a genuinely ZERO size is flat (correctly skipped).
+
+    Scope FIRST on the dict KEY (the authoritative marketId, per fetch_positions' contract and how
+    out.append/downstream key off `mid`), NOT the body's marketId field: a body that omitted marketId would
+    make str(None) != target_mid silently skip a real position, AND scoping first means an out-of-scope
+    malformed position can't block a --market close of a DIFFERENT market."""
+    out, unknown = [], []
     for mid, p in fetch_positions(address).items():
-        size = dec(p.get("size"))
-        if size is None or size == 0:
+        if target_mid is not None and str(mid) != target_mid:   # out of scope -> ignore
             continue
-        if target_mid is not None and str(p.get("marketId")) != target_mid:
+        if not isinstance(p, dict):
+            unknown.append(f"marketId {mid} (non-dict position value: {type(p).__name__})")
+            continue
+        raw = p.get("size")
+        size = dec(raw)
+        if size is None:                       # missing / NaN / Inf / non-numeric -> exposure UNKNOWN, NOT flat
+            unknown.append(f"marketId {mid} (unparseable size {raw!r})")
+            continue
+        if size == 0:                          # genuinely flat -> not open (correctly skipped)
             continue
         out.append((mid, p))
-    return out
+    return out, unknown
 
 
 def main():
@@ -94,24 +98,31 @@ def main():
 
     # Fetch market metadata up front: it supplies mark/tick/step for the plan AND lets us VALIDATE
     # --market -- a typo (e.g. BTX-USD) must FAIL, not silently match no positions and "succeed".
-    markets = call("GET", "/v1/markets")["markets"]
-    by_id = {str(m["marketId"]): m for m in markets}
+    resp = call("GET", "/v1/markets")
+    if not isinstance(resp, dict) or not isinstance(resp.get("markets"), list):
+        raise SystemExit(f"{PROG}: unexpected /v1/markets response (expected an object with a 'markets' list).")
+    markets = resp["markets"]
+    by_id = {str(m["marketId"]): m for m in markets if isinstance(m, dict) and m.get("marketId") is not None}
     target_mid, scope = None, ""
     if args.market:
         mkt = resolve_market(markets, args.market)
         if mkt is None:
             raise SystemExit(f"{PROG}: unknown market {args.market!r} (not found in /v1/markets).")
+        if mkt.get("marketId") is None:
+            raise SystemExit(f"{PROG}: market {args.market!r} has malformed metadata (no marketId).")
         target_mid = str(mkt["marketId"])
-        scope = f" market {mkt['marketDisplayName']}"
+        scope = f" market {mkt.get('marketDisplayName', args.market)}"
 
-    positions = open_positions(address, target_mid)
-    if not positions:
+    positions, unknown = open_positions(address, target_mid)
+    if not positions and not unknown:          # truly nothing in scope (all sizes genuinely 0) -> flat, exit 0
         print(f"\n  No open positions for {address}{scope} [{args.network}]\n")
         return
 
     # Build the close plan. Sub-step dust (|size| < stepSize) CANNOT be traded -> record it (never a
-    # silent skip + exit 0); the final re-query below reports it as still-open and exits nonzero.
-    plan, dust, skipped = [], [], []
+    # silent skip + exit 0); the final re-query below reports it as still-open and exits nonzero. Seed
+    # `skipped` with UNKNOWN-exposure positions (malformed/unparseable size): NOT flat, NOT closeable, so
+    # they must flow into the "not flat -> exit 1" accounting rather than vanish into a false success.
+    plan, dust, skipped = [], [], list(unknown)
     for mid, pos in positions:
         m = by_id.get(str(mid))
         if m is None:
@@ -120,6 +131,19 @@ def main():
             # it still open -> NOT flat -> exit 1.
             skipped.append(f"marketId {mid} (not in /v1/markets)")
             print(f"  skip marketId {mid}: not found in /v1/markets -- NOT closeable", flush=True)
+            continue
+        try:                                    # a malformed /v1/markets entry (missing id/name/tick/step, or a
+            disp = str(m["marketDisplayName"])  # non-numeric id) can't be closed -> skip+record (don't abort the
+            mkt_id_int = int(m["marketId"])     # whole flatten; the residual re-query below catches it -> exit 1)
+            tick, step = m["tickSize"], m["stepSize"]
+            dt, ds = dec(tick), dec(step)
+            if dt is None or ds is None or dt <= 0 or ds <= 0:   # require FINITE and > 0: a 0 step -> round_to_increment
+                raise ValueError                                 # DivisionByZero (would abort the WHOLE flatten); a negative
+                                                                 # tick/step -> negative signed quantums (ordersign rejects only 0)
+        except (KeyError, ValueError, TypeError):
+            skipped.append(f"marketId {mid} (incomplete/invalid market metadata)")
+            print(f"  skip marketId {mid}: incomplete/invalid market metadata (tickSize/stepSize must be > 0) "
+                  f"-- NOT closeable", flush=True)
             continue
         size = dec(pos.get("size"))
         # A MARKET order's protective bound is validated against markPrice (within 10% of mark, per docs).
@@ -136,7 +160,6 @@ def main():
             print(f"  skip {m.get('marketDisplayName')}: no markPrice ('0' = none received yet) -- can't "
                   f"bound a reduce-only MARKET close; NOT closeable", flush=True)
             continue
-        tick, step = m["tickSize"], m["stepSize"]
         close_side = "SELL" if size > 0 else "BUY"           # reduce a long by selling, a short by buying
         qty = round_to_increment(abs(size), step, ROUND_FLOOR)
         if qty <= 0:
@@ -148,7 +171,18 @@ def main():
         # (BUY-to-close UP, SELL-to-close DOWN) -- same direction as place_order's market bound.
         target = mark * (1 + slip) if close_side == "BUY" else mark * (1 - slip)
         bound = round_to_increment(target, tick, ROUND_CEILING if close_side == "BUY" else ROUND_FLOOR)
-        plan.append({"market": m["marketDisplayName"], "market_id": int(m["marketId"]),
+        # Keep the bound within the venue's 10%-of-mark cap: tick-rounding AWAY (above) can push an aggressive
+        # --max-slippage / coarse tick past 10% -> the venue REJECTS the whole close. Clamp inward so it lands.
+        bound = clamp_to_mark_cap(bound, mark, tick, close_side == "BUY")
+        # A SELL-to-close floor can tick-round DOWN to 0 when the price is within ~1 tick of tickSize
+        # (target < tick), leaving the reduce-only MARKET close with NO protective floor. Skip+record
+        # (don't abort the whole flatten) -- the residual re-query below then reports it -> exit 1.
+        if bound <= 0:
+            skipped.append(f"{disp} (protective bound rounded to 0)")
+            print(f"  skip {disp}: protective bound rounded to {bound} (price within ~1 tick of tickSize "
+                  f"{tick}) -- a MARKET close would carry no protective floor; NOT closeable this way", flush=True)
+            continue
+        plan.append({"market": disp, "market_id": mkt_id_int,
                      "side": close_side, "qty": qty, "bound": bound, "mark": mark, "tick": tick, "step": step})
 
     if not plan:
@@ -186,9 +220,9 @@ def main():
                     "price": price, "timeInForce": "IOC", "timestamp": ct,
                     "goodTilTime": good_til_us, "reduceOnly": True}
             resp = call("POST", "/v1/placeOrder?" + urllib.parse.urlencode({"address": address}), body, headers)
-            check_order_response(resp, f"close {q['market']}")   # 2xx body can carry status REJECTED/ERROR
-            if not isinstance(resp, dict):                        # non-object 2xx body -> count as FAIL (before ok++), not both
-                raise SystemExit(f"non-object placeOrder response for {q['market']}: {resp!r}")
+            check_order_response(resp, f"close {q['market']}")   # 2xx body: raises on a non-dict body OR a REJECTED/
+                                                                 # ERROR status -> caught below as a FAIL (so resp is a
+                                                                 # dict here; no separate isinstance check needed)
             ok += 1
             print(f"  closing {q['market']} -> {q['side']} {qty_str} reduce-only  (orderId {resp.get('orderId', '')})")
         except (Exception, SystemExit) as e:                  # SystemExit = check_order_response reject; never fatal here
@@ -200,7 +234,8 @@ def main():
     # above) -- the account is flat only if NOTHING remains open in scope.
     time.sleep(SETTLE_SECONDS)
     try:
-        residual = [f"{p.get('marketDisplayName')}={p.get('size')}" for _, p in open_positions(address, target_mid)]
+        res_open, res_unknown = open_positions(address, target_mid)
+        residual = [f"{p.get('marketDisplayName')}={p.get('size')}" for _, p in res_open] + res_unknown
     except (OSError, json.JSONDecodeError, SystemExit) as e:   # call() wraps transport/JSON errors as SystemExit
         print(f"  WARNING could not re-query positions to confirm flat ({describe_error(e)}); "
               f"treating as INCOMPLETE.", file=sys.stderr)
