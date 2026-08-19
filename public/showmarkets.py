@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""List Arcus testnet markets.
+"""List Arcus markets (testnet, staging, or mainnet).
 
   showmarkets.py                     # aligned table of the common columns
   showmarkets.py --condensed         # CSV of the common columns (for piping)
@@ -9,17 +9,10 @@
 
 import argparse
 import csv
-import json
 import os
 import sys
-import urllib.error
-import urllib.request
+from arcus_common_public import NETWORKS, get_json, market_id_key, markets_cache_path, require_dict, write_markets_cache   # shared public helpers (formerly local copies)
 
-NETWORKS = {
-    "testnet": "https://api.testnet.arcus.xyz",
-    "staging": "https://api.staging.arcus.xyz",
-    "mainnet": "https://api.arcus.xyz",       # live 2026-06-25 (reads only for now)
-}
 MARKETS_URL = None   # set in main() from the required --testnet/--staging selector
 
 # --createjson writes the raw /v1/markets response here for the launcher's other tools (wsorderbook /
@@ -28,22 +21,7 @@ MARKETS_URL = None   # set in main() from the required --testnet/--staging selec
 # path so a foreign/stale file at the predictable path can never be trusted (a unique-path write
 # failure just leaves no file -> readers fail-open to a live fetch, never to stale data). Falls back to
 # a NETWORK-scoped predictable path for manual use (testnet/staging/mainnet marketId maps differ).
-MARKETS_CACHE_FMT = "/tmp/arcus_markets_{network}.json"
 
-
-def _write_markets_cache(path, data):
-    """Best-effort ATOMIC write (temp + os.replace, so a reader never sees a partial file) of the
-    raw markets response. Never raises: failing to warm the cache must not break normal output."""
-    tmp = f"{path}.{os.getpid()}.tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        os.replace(tmp, path)
-    except OSError:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
 
 # (key, alignment) for the default/condensed common columns.
 COMMON_COLS = [
@@ -52,44 +30,18 @@ COMMON_COLS = [
 ]
 
 
-def market_id_key(m):
-    """Sort key by numeric marketId; missing/non-numeric ids sort last (no crash)."""
-    try:
-        return (0, int(m["marketId"]))
-    except (KeyError, ValueError, TypeError):
-        return (1, 0)
-
-
-def require_dict(data, what):
-    """A decoded JSON body that must be an object -> clean CLI error if the server returned null /
-    a list / a scalar instead (so the .get(...) below can't AttributeError)."""
-    if not isinstance(data, dict):
-        raise SystemExit(f"showmarkets: unexpected {what} response shape (not a JSON object)")
-    return data
-
-
 def fetch_markets(cache_path=None):
     """Fetch and sort markets, turning network/parse failures into clean CLI errors. When cache_path
     is set, the RAW response is also written there (best-effort) to warm the launcher's shared cache
     -- we always fetch fresh (never read that cache) so displayed output is never stale."""
-    try:
-        with urllib.request.urlopen(MARKETS_URL, timeout=10) as r:
-            data = json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        raise SystemExit(f"showmarkets: HTTP {e.code} fetching markets: {e.reason}")
-    except urllib.error.URLError as e:
-        raise SystemExit(f"showmarkets: could not reach {MARKETS_URL}: {e.reason}")
-    except (TimeoutError, OSError) as e:        # socket timeout / connection issues
-        raise SystemExit(f"showmarkets: network error: {e}")
-    except json.JSONDecodeError as e:
-        raise SystemExit(f"showmarkets: invalid JSON from server: {e}")
+    data = get_json(MARKETS_URL, what="markets", prog="showmarkets")   # retries transient failures + honors Retry-After (like the sibling tools)
 
-    markets = require_dict(data, "markets").get("markets")
+    markets = require_dict(data, "markets", "showmarkets").get("markets")
     if not isinstance(markets, list):
         raise SystemExit("showmarkets: unexpected response shape (no 'markets' list).")
     if cache_path is not None:
-        _write_markets_cache(cache_path, data)   # raw shape {"markets": [...]} for sibling tools
-    return sorted(markets, key=market_id_key)
+        write_markets_cache(cache_path, data)   # raw shape {"markets": [...]} for sibling tools
+    return sorted((m for m in markets if isinstance(m, dict)), key=market_id_key)
 
 
 def all_keys(markets):
@@ -146,8 +98,7 @@ def main():
     args = parser.parse_args()
     MARKETS_URL = NETWORKS[args.network] + "/v1/markets"
 
-    cache_path = (os.environ.get("ARCUS_MARKETS_CACHE")
-                  or MARKETS_CACHE_FMT.format(network=args.network)) if args.createjson else None
+    cache_path = markets_cache_path(args.network) if args.createjson else None
     markets = fetch_markets(cache_path)
 
     if args.condensed:
