@@ -15,19 +15,16 @@ per-market lastSequenceId is checked for gaps -- on a gap it re-subscribes
 import argparse
 import asyncio
 import json
-import logging
 import os
 import re
 import sys
 import time
-import urllib.error
-from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from logging.handlers import RotatingFileHandler
 
 import aiohttp
 import websockets
 from aiohttp import web
+from arcus_common_public import NETWORKS, PUB_RECREATE_AFTER, PUB_SOCKET_TIMEOUT, REDIS_URL, _PUB_ERR_THROTTLE, describe_error, emit as _emit, log_ts, markets_cache_path, now_iso, plan_reconnect_sleep, positive_int, read_markets_cache, require_dict, setup_logger, write_markets_cache, ws_url   # shared public helpers (formerly local copies)
 
 try:
     import redis.asyncio as aioredis      # OPTIONAL dependency: absent => the BBO→Redis feature is simply off
@@ -35,11 +32,6 @@ except ImportError:
     aioredis = None
 
 # ── Constants ────────────────────────────────────────────────────────────────
-NETWORKS = {
-    "testnet": "https://api.testnet.arcus.xyz",
-    "staging": "https://api.staging.arcus.xyz",
-    "mainnet": "https://api.arcus.xyz",       # live 2026-06-25 (reads only for now)
-}
 BASE_URL     = None   # all four set in main() from the required --testnet/--staging/--mainnet selector
 MARKETS_URL  = None
 WS_URL       = None
@@ -52,17 +44,23 @@ MARKETS_CACHE = None
 # predictable path only for manual/standalone use (testnet/staging/mainnet marketId maps differ, so
 # they must never be crossed). Read is fail-open -- a missing/corrupt file just falls back to a live
 # fetch. The launcher removes its per-run file when it finishes.
-MARKETS_CACHE_FMT = "/tmp/arcus_markets_{network}.json"
 
 # HTTP port = PORT_BASE[network] + marketId. Per-network base keeps the 3 networks'
 # orderbook servers on disjoint ranges (1000 markets each): mainnet 10xxx, testnet
 # 11xxx, staging 12xxx.
 PORT_BASE = {"mainnet": 10000, "testnet": 11000, "staging": 12000}
+MAX_MARKET_ID   = 999   # PORT_BASE entries are 1000 apart, so a marketId >= 1000 would push the port into the
+                        # NEXT network's band (mainnet 1000 -> 11000 = testnet's base) or past 65535. Mirrors
+                        # showorderbook.MAX_MARKET_ID -- the reader already rejects out-of-band ids; the server must too.
 LOG_BASE        = "/mnt/arcuslogs"   # logs go under LOG_BASE/<network> (subdir auto-created)
 LOG_MAX_BYTES   = 2097152
 LOG_BACKUP      = 4
 RECONNECT_BASE  = 1
-RECONNECT_MAX   = 60
+RECONNECT_MAX   = 60         # exponential-backoff cap for the DEFAULT path ONLY -- UNUSED under --reconnect-interval.
+                            # Was briefly 120 to halve a 39-proc fleet's max-backoff attempt rate (78->39/min), but
+                            # MAX-tuning does NOT fix the real trigger (a VPN IP-change drops ALL conns at once);
+                            # --reconnect-interval is the fix. Reverted to 60 to match dydxv4 -- a large single-IP
+                            # fleet should set --reconnect-interval (which ignores this).
 STABLE_AFTER    = 30         # s a connection must STAY UP before backoff resets (else an accept-then-close flap busy-loops)
 OPEN_TIMEOUT    = 10
 PING_INTERVAL   = 20
@@ -71,7 +69,6 @@ MARKET_RE       = re.compile(r"^[A-Za-z0-9._-]+$")   # safe for filenames + ids
 
 # Optional BBO → Redis publisher. redis-py is an OPTIONAL dependency; if it's absent (aioredis is None)
 # the bbo subscription is skipped and this tool behaves exactly as before (HTTP orderbook only).
-REDIS_URL   = os.environ.get("ARCUS_REDIS_URL", "redis://127.0.0.1:6379/0")
 BBO_KEY_FMT = "arcus:{network}:bbo:{market}"   # one key per market; value = native bbo `contents` + our `ts`
 BBO_TTL     = 3        # s; ≈ the reader's age-guard AND > HEARTBEAT so a live-but-quiet key never expires between beats
 HEARTBEAT   = 1.0      # s; refresh `ts` at least this often while the socket is up (idle markets stay "alive")
@@ -79,6 +76,15 @@ HEARTBEAT   = 1.0      # s; refresh `ts` at least this often while the socket is
 
 class SequenceGap(Exception):
     """Raised when the L2 delta stream skips a sequence id (local book may be stale)."""
+
+
+class MalformedFrame(SequenceGap):
+    """Raised when a frame is UNUSABLE due to bad shape (a snapshot missing bids/asks lists / all-malformed
+    rows; a delta that isn't an object, has no numeric lastSequenceId, or carries a non-list side). A subclass
+    of SequenceGap so it still means "book not trustworthy", but caught SEPARATELY in ws_loop and takes the
+    NORMAL BACKOFF path. A GENUINE sequence gap (seq != last+1) resyncs IMMEDIATELY (a fresh snapshot fixes it,
+    no backoff); a persistently MALFORMED frame can't be fixed by resyncing, so a no-backoff resync would spin
+    a tight reconnect storm (self-DoS, worst exactly during a venue incident) -- hence it backs off instead."""
 
 
 # ── Order book state ──────────────────────────────────────────────────────────
@@ -96,16 +102,29 @@ class OrderBook:
         self._awaiting_first_delta = False
 
     def _apply(self, book, levels, seq):
-        for price, size in levels:
+        if not isinstance(levels, list):        # a present-but-non-list bids/asks (bad shape) -> MALFORMED -> backoff
+            raise MalformedFrame(f"levels is not a list: {type(levels).__name__}")   # (not a genuine seq gap; don't storm)
+        for lv in levels:
+            try:
+                price, size = lv                # a scalar / wrong-arity row -> skip it (matches the bad-value skips
+            except (TypeError, ValueError):     # below); never let one malformed row crash to the [ws error]+backoff path
+                continue
             try:
                 key = Decimal(price)
             except (InvalidOperation, TypeError, ValueError):
                 continue
+            if not key.is_finite():                 # Decimal() accepts "NaN"/"Infinity" -- a non-finite PRICE can't be
+                continue                            # a real level; it leaks into the served /orderbook and NaN-keys the
+                                                    # payload() Decimal sort (-> HTTP 500). Drop the row.
             try:
-                is_zero = Decimal(size) == 0
+                dsize = Decimal(size)
             except (InvalidOperation, TypeError, ValueError):
-                is_zero = (str(size) == "0")
-            if is_zero:
+                continue                            # unparseable SIZE (JSON null / "" / non-numeric) -> malformed ->
+                                                    # drop, exactly like the non-finite case below. (The #13 guard set
+                                                    # dsize=None and fell through, STORING the bad size to be served.)
+            if not dsize.is_finite():               # non-finite SIZE ("NaN"/"Infinity") -> malformed -> drop
+                continue
+            if dsize == 0:                          # explicit removal
                 book.pop(key, None)
             else:
                 book[key] = [price, size, seq]
@@ -115,15 +134,30 @@ class OrderBook:
         """lastSequenceId as int (accepts int or numeric string), else None."""
         try:
             return int(contents.get("lastSequenceId"))
-        except (TypeError, ValueError):
+        except (AttributeError, TypeError, ValueError):   # AttributeError: contents isn't a dict (bad shape)
             return None
 
     def on_snapshot(self, contents):
+        # A snapshot is a FULL replacement, so it MUST explicitly carry BOTH sides as lists. If bids/asks are
+        # absent (or contents isn't a dict), .get(...,[]) would fabricate an EMPTY book and still set ready=True
+        # -- a reader would then read "ready, no liquidity" off a malformed frame (fail-OPEN). A genuinely empty
+        # market still sends bids:[] and asks:[], so requiring them loses nothing. Malformed -> resync (reset +
+        # immediate resubscribe) rather than serve a fabricated-empty ready book.
+        if not (isinstance(contents, dict)
+                and isinstance(contents.get("bids"), list)
+                and isinstance(contents.get("asks"), list)):
+            raise MalformedFrame(f"malformed snapshot (bids/asks not present as lists): {type(contents).__name__}")
         seq = self._seq(contents)             # normalized to int (or None)
         self.bids.clear()
         self.asks.clear()
-        self._apply(self.bids, contents.get("bids", []), seq)
-        self._apply(self.asks, contents.get("asks", []), seq)
+        self._apply(self.bids, contents["bids"], seq)
+        self._apply(self.asks, contents["asks"], seq)
+        # Fabricate-empty guard: _apply skips malformed rows, so a side whose rows are ALL malformed would drop
+        # to empty and we'd serve an empty book as READY (fail-OPEN). A genuinely empty market sends an EMPTY
+        # list, so "rows in, none survived" means malformed -> resync rather than mark ready off a fabricated-
+        # empty side. (An all-zero-size snapshot side, which shouldn't occur, also resyncs -- benign, recovers.)
+        if (contents["bids"] and not self.bids) or (contents["asks"] and not self.asks):
+            raise MalformedFrame("snapshot rows all malformed/empty (side dropped to empty)")
         self.last_seq = seq
         # The first delta after a snapshot is NOT snapshot_seq+1 (the snapshot's
         # ln lags the live stream), so adopt its seq as baseline without a gap check.
@@ -131,9 +165,11 @@ class OrderBook:
         self.ready = True
 
     def on_delta(self, contents):
+        if not isinstance(contents, dict):    # bad SHAPE (not a genuine seq gap) -> MalformedFrame -> backoff, not
+            raise MalformedFrame(f"delta contents is not an object: {type(contents).__name__}")   # a no-backoff storm
         seq = self._seq(contents)
-        if seq is None:                       # missing/malformed -> resync
-            raise SequenceGap(f"missing/non-numeric lastSequenceId: {contents.get('lastSequenceId')!r}")
+        if seq is None:                       # missing/non-numeric lastSequenceId = malformed frame -> backoff
+            raise MalformedFrame(f"missing/non-numeric lastSequenceId: {contents.get('lastSequenceId')!r}")
         if self.last_seq is not None and not self._awaiting_first_delta:
             if seq != self.last_seq + 1:
                 raise SequenceGap(f"expected {self.last_seq + 1}, got {seq}")
@@ -149,51 +185,6 @@ class OrderBook:
 
 
 # ── Logger setup ─────────────────────────────────────────────────────────────
-def setup_logger(name: str, path: str) -> logging.Logger:
-    logger = logging.getLogger(name)
-    if logger.handlers:
-        return logger
-    handler = RotatingFileHandler(path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP)
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    logger.setLevel(logging.DEBUG)
-    logger.addHandler(handler)
-    logger.propagate = False
-    return logger
-
-
-def _emit(logger, line):
-    try:
-        logger.debug(line)
-    except Exception as e:
-        print(f"[log error] {e}", file=sys.stderr)
-
-
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def require_dict(data, what):
-    """A decoded JSON body that must be an object -> clean CLI error if the server returned null /
-    a list / a scalar instead (so the .get(...) below can't AttributeError)."""
-    if not isinstance(data, dict):
-        raise SystemExit(f"wsorderbook: unexpected {what} response shape (not a JSON object)")
-    return data
-
-
-def describe_error(e):
-    """Readable one-line error (uniform with market_maker.py)."""
-    if isinstance(e, urllib.error.HTTPError):
-        try:
-            return f"HTTP {e.code}: {e.read().decode()[:160]}"
-        except Exception:
-            return f"HTTP {e.code}"
-    if isinstance(e, urllib.error.URLError):
-        return f"unreachable: {e.reason}"
-    if isinstance(e, json.JSONDecodeError):
-        return f"bad JSON: {e}"
-    return f"{type(e).__name__}: {e}"
-
-
 # ── HTTP handler ─────────────────────────────────────────────────────────────
 async def handle_orderbook(request):
     book = request.app["book"]
@@ -204,35 +195,121 @@ async def handle_orderbook(request):
 
 
 # ── BBO → Redis publisher (optional) ─────────────────────────────────────────
-_PUB_ERR_THROTTLE = 30.0            # s; at most one "[bbo redis]" line per this window -- a down/slow Redis on
 _pub_err_last = 0.0                 # a busy market would otherwise print after EVERY frame + heartbeat and
 _pub_err_suppressed = 0            # flood the redirected stdout/err log.
+_pub_recreate_last = 0.0           # separate throttle for the "recreated client" notice (same flood concern)
+                                   # instead of hanging the WS ingestion loop -- that raise feeds _fails ->
+                                   # _recreate (the real analog to dydxv4's per-call deadline). Kept at the
+                                   # HEARTBEAT cadence: publish() is awaited INSIDE the recv loop, so a larger
+                                   # value would stall order-book ingestion that long per cycle during a wedge
+                                   # (and localhost Redis answers sub-ms, so 1s is already hugely generous).
 
 
-async def publish_bbo(r, key, contents, ts):
-    """Write the native `bbo` contents verbatim + our liveness `ts` to Redis. Guarded + async so a
-    Redis hiccup or slow SET can NEVER stall or crash the WS/book/HTTP path (the existing contract).
-    `ts` is our write time (unix seconds); the reader ages off it to decide the feed is alive."""
-    if r is None:
-        return
-    blob = dict(contents)          # bestBid/bestAsk (price+size), lastSequenceId, globalSequenceId, timestamp -- verbatim
-    blob["ts"] = ts
-    global _pub_err_last, _pub_err_suppressed
+def _pub_log(msg):
+    """stderr log that NEVER raises. publish()/_recreate() run inside the WS recv loop, so a logging
+    failure (e.g. OSError writing a disk-full redirected stderr) must not propagate and disturb the book."""
     try:
-        await r.set(key, json.dumps(blob, separators=(",", ":")), ex=BBO_TTL)
-        _pub_err_suppressed = 0     # recovered -> the next distinct error window logs its first line immediately
-    except Exception as e:         # redis down / slow / misconfigured -- log (throttled), never propagate
+        print(f"[{log_ts()}] {msg}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+def _new_bbo_client(url):
+    """A redis.asyncio client with bounded socket + connect timeouts, so a hung/wedged connection RAISES
+    (feeding the self-heal counter) rather than stalling the WS ingestion loop indefinitely."""
+    return aioredis.from_url(url, socket_timeout=PUB_SOCKET_TIMEOUT, socket_connect_timeout=PUB_SOCKET_TIMEOUT)
+
+
+def _finite_pos(v):
+    """True iff `v` parses as a finite Decimal > 0."""
+    try:
+        d = Decimal(str(v))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    return d.is_finite() and d > 0
+
+
+def _bbo_ok(contents):
+    """VALIDATE a bbo `contents` (a dict) BEFORE writing it to Redis: each of bestBid/bestAsk must be null/absent
+    (an empty side -> the reader falls back) OR a dict carrying a finite-POSITIVE price AND size. A present-but-
+    garbage side (missing / non-finite / non-positive price|size, e.g. {"bestBid":{"price":"NaN"}}) means the
+    frame is untrustworthy -- don't publish a top-of-book the MM would read off it. (The reader validates too;
+    the publisher simply must not write junk.) An empty {} (empty market) is valid -> published as null sides."""
+    for s in ("bestBid", "bestAsk"):
+        v = contents.get(s)
+        if v is None:
+            continue
+        if not (isinstance(v, dict) and _finite_pos(v.get("price")) and _finite_pos(v.get("size"))):
+            return False
+    return True
+
+
+class BboPublisher:
+    """Owns the (optional) Redis client for BBO publishing and SELF-HEALS. A publish failure NEVER
+    propagates -- the WS/book/HTTP path must never stall or crash on Redis (the existing contract). The
+    client has bounded socket/connect timeouts, so a wedged connection RAISES (it can't hang the WS loop);
+    redis.asyncio's pool auto-reconnects a fast-failing client on the next command, and after
+    PUB_RECREATE_AFTER CONSECUTIVE failures we also recreate the client outright to clear a stuck pool
+    (the deadline+rebuild pairing mirrors dydxv4's channel-rebuild self-heal).
+    `ts` is our write time (unix seconds); the reader ages off it to decide the feed is alive."""
+
+    def __init__(self, url):
+        self._url = url
+        self._r = _new_bbo_client(url)   # from_url is lazy (no I/O) -- connects on the first command
+        self._fails = 0
+
+    async def publish(self, key, contents, ts):
+        # VALIDATE BEFORE WRITING. (1) A truthy NON-dict (venue glitch: list/str/number) would raise in dict()
+        # below, OUTSIDE the try -> bubble to ws_loop -> RESET the core L2 book (BBO is auxiliary, must never do
+        # that). (2) A dict with a GARBAGE bestBid/bestAsk (non-finite/non-positive price|size) must not be written
+        # verbatim for the MM to read a bad top-of-book off. Skip either -> key ages out / heartbeat keeps last-good.
+        if not (isinstance(contents, dict) and _bbo_ok(contents)):
+            return
+        blob = dict(contents)      # bestBid/bestAsk (price+size), lastSequenceId, globalSequenceId, timestamp -- verbatim
+        blob["ts"] = ts
+        global _pub_err_last, _pub_err_suppressed
+        try:
+            await self._r.set(key, json.dumps(blob, separators=(",", ":")), ex=BBO_TTL)
+            self._fails = 0
+            _pub_err_suppressed = 0     # recovered; _pub_err_last is intentionally NOT reset, so a flapping
+                                        # Redis (fail/succeed/fail...) still can't flood -- the 30s window persists
+        except Exception as e:         # redis down / slow / wedged -- log (throttled), never propagate
+            self._fails += 1
+            now = time.monotonic()
+            if now - _pub_err_last >= _PUB_ERR_THROTTLE:
+                extra = f" (+{_pub_err_suppressed} suppressed)" if _pub_err_suppressed else ""
+                _pub_log(f"[bbo redis] {describe_error(e)}{extra}")
+                _pub_err_last, _pub_err_suppressed = now, 0
+            else:
+                _pub_err_suppressed += 1
+            if self._fails >= PUB_RECREATE_AFTER:
+                await self._recreate()
+
+    async def _recreate(self):
+        """Discard the current client (best-effort close) and build a fresh one -- resets the connection
+        pool; the next publish reconnects. Fully guarded: MUST NOT raise (it runs inside publish()'s
+        except, and a raise here would propagate to the WS loop and force a needless reconnect)."""
+        global _pub_recreate_last
+        old = self._r
+        try:
+            self._r = _new_bbo_client(self._url)
+        except Exception:
+            pass                        # from_url is lazy (near-impossible to raise); keep the old client if so
+        self._fails = 0                 # reset regardless, so a failed rebuild doesn't re-enter recreate every cycle
         now = time.monotonic()
-        if now - _pub_err_last >= _PUB_ERR_THROTTLE:
-            extra = f" (+{_pub_err_suppressed} suppressed)" if _pub_err_suppressed else ""
-            print(f"[bbo redis] {describe_error(e)}{extra}", file=sys.stderr)
-            _pub_err_last, _pub_err_suppressed = now, 0
-        else:
-            _pub_err_suppressed += 1
+        if now - _pub_recreate_last >= _PUB_ERR_THROTTLE:   # throttle like the error line (avoid outage flood)
+            _pub_log(f"[bbo redis] recreated client after {PUB_RECREATE_AFTER} consecutive failures")
+            _pub_recreate_last = now
+        try:
+            closer = getattr(old, "aclose", None) or getattr(old, "close", None)   # aclose() (redis-py >=5) or close()
+            if closer is not None:
+                await asyncio.wait_for(closer(), PUB_SOCKET_TIMEOUT)   # bound it too, so recreate adds no unbounded stall
+        except Exception:
+            pass
 
 
 # ── Frame handling / WebSocket loop ──────────────────────────────────────────
-async def handle_frame(raw, book, loggers, add_ts, r, key, state):
+async def handle_frame(raw, book, loggers, add_ts, pub, key, state):
     try:
         msg = json.loads(raw)
     except json.JSONDecodeError as e:
@@ -248,10 +325,14 @@ async def handle_frame(raw, book, loggers, add_ts, r, key, state):
         # heartbeat won't double-write right after. contents may be {} for an empty market -> null sides.
         # (The heartbeat covers the SPARSE-bbo case: this socket is often flooded by oraclePrices while bbo
         # rarely arrives -- measured AAPL mainnet ~69 oracle vs 1 bbo per 20s -- so the key stays warm.)
-        if r is not None and msg.get("type") in ("subscribed", "channel_data"):
-            state["bbo"] = msg.get("contents") or {}
-            await publish_bbo(r, key, state["bbo"], time.time())
-            state["last_pub"] = time.monotonic()
+        if pub is not None and msg.get("type") in ("subscribed", "channel_data"):
+            c = msg.get("contents")
+            if isinstance(c, dict) and _bbo_ok(c):        # well-formed (empty market, or finite-positive bestBid/bestAsk)
+                state["bbo"] = c
+                await pub.publish(key, state["bbo"], time.time())
+                state["last_pub"] = time.monotonic()
+            # else: non-dict / garbage-field bbo -> KEEP the last-good state["bbo"] (the heartbeat republishes it),
+            # never storing or writing junk. (publish() re-validates too, so a bad frame can't reach Redis.)
         return
     logger = loggers.get(channel)
     if logger is None:                          # not a subscribed channel -> stdout
@@ -263,12 +344,18 @@ async def handle_frame(raw, book, loggers, add_ts, r, key, state):
     if channel == "l2OrderbookUpdates":
         contents = msg.get("contents") or {}
         if msg.get("type") == "subscribed":
-            book.on_snapshot(contents)
+            try:
+                book.on_snapshot(contents)
+            except SequenceGap as e:
+                # Safety net: on_snapshot (and _apply beneath it) now raise MalformedFrame directly for every
+                # snapshot-application failure; force the BACKOFF path for any residual SequenceGap too -- a
+                # malformed snapshot resyncs to another malformed one, so it must NOT take the no-backoff path.
+                raise MalformedFrame(str(e)) from e
         elif msg.get("type") == "channel_data":
-            book.on_delta(contents)            # may raise SequenceGap
+            book.on_delta(contents)            # MalformedFrame (bad shape) -> backoff; SequenceGap (true gap) -> resync
 
 
-async def ws_loop(url, subscriptions, book, loggers, add_ts, r, key):
+async def ws_loop(url, subscriptions, book, loggers, add_ts, pub, key, reconnect_interval=None):
     delay = RECONNECT_BASE
     while True:
         conn_start = None
@@ -282,7 +369,7 @@ async def ws_loop(url, subscriptions, book, loggers, add_ts, r, key):
                 conn_start = time.monotonic()
                 for sub in subscriptions:
                     await ws.send(json.dumps(sub))
-                if r is not None:
+                if pub is not None:
                     # Redis present: ON-CHANGE writes happen in handle_frame (every bbo msg). Here we add the
                     # HEARTBEAT: republish the latest bbo whenever it's been quiet >= HEARTBEAT (driven by any
                     # socket activity OR the recv timeout). Needed because the bbo channel is often sparse while
@@ -292,12 +379,12 @@ async def ws_loop(url, subscriptions, book, loggers, add_ts, r, key):
                     while True:
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=HEARTBEAT)
-                            await handle_frame(raw, book, loggers, add_ts, r, key, state)
+                            await handle_frame(raw, book, loggers, add_ts, pub, key, state)
                         except asyncio.TimeoutError:
                             pass
                         now = time.monotonic()
                         if state["bbo"] is not None and now - state["last_pub"] >= HEARTBEAT:
-                            await publish_bbo(r, key, state["bbo"], time.time())
+                            await pub.publish(key, state["bbo"], time.time())
                             state["last_pub"] = now
                 else:
                     # No redis: the original loop, untouched (no heartbeat needed).
@@ -306,66 +393,47 @@ async def ws_loop(url, subscriptions, book, loggers, add_ts, r, key):
             # Clean close (server ended the stream without an exception): the book
             # is now stale, so stop serving it as ready until the next snapshot.
             book.reset()
-            print("[ws] connection closed — resubscribing for a fresh snapshot", file=sys.stderr)
-        except SequenceGap as e:
-            print(f"[seq gap] {e} — resubscribing for a fresh snapshot", file=sys.stderr)
+            print(f"[{log_ts()}] [ws] connection closed — resubscribing for a fresh snapshot", file=sys.stderr)
+        except MalformedFrame as e:
+            # Unrecoverable-by-resync: a persistently malformed snapshot OR delta (bad shape / non-list side /
+            # missing seq). Reset and take the NORMAL backoff path (leave backoff=True) so we don't spin a tight
+            # zero-sleep reconnect storm. MUST precede the SequenceGap handler below (MalformedFrame subclasses it).
+            print(f"[{log_ts()}] [bad frame] {e} — resubscribing (with backoff)", file=sys.stderr)
             book.reset()
-            backoff = False                    # immediate resync, no backoff
+        except SequenceGap as e:
+            print(f"[{log_ts()}] [seq gap] {e} — resubscribing for a fresh snapshot", file=sys.stderr)
+            book.reset()
+            backoff = False                    # immediate resync, no backoff (only a GENUINE seq gap reaches here now)
         except websockets.ConnectionClosedOK:
             # Redis branch only: a clean server close surfaces as an exception (unlike async-for). Treat
             # it exactly like the clean-close path above (reset + normal backoff), NOT as an error.
             book.reset()
-            print("[ws] connection closed — resubscribing for a fresh snapshot", file=sys.stderr)
+            print(f"[{log_ts()}] [ws] connection closed — resubscribing for a fresh snapshot", file=sys.stderr)
         except Exception as e:
-            print(f"[ws error] {describe_error(e)} — reconnecting", file=sys.stderr)   # actual delay set after the stability reset below
+            print(f"[{log_ts()}] [ws error] {describe_error(e)} — reconnecting", file=sys.stderr)   # actual delay set after the stability reset below
             book.reset()
         # Sleep/backoff for a clean close OR an error (NOT a seq-gap). Previously a CLEAN close skipped
         # every except and busy-looped at 0 delay; and resetting delay on connect defeated backoff on a
         # flap. Now: reset delay only if the connection proved STABLE (>= STABLE_AFTER s), then sleep.
         if backoff:
-            if conn_start is not None and (time.monotonic() - conn_start) >= STABLE_AFTER:
-                delay = RECONNECT_BASE
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, RECONNECT_MAX)
+            # Default: exponential backoff (full jitter, doubling to RECONNECT_MAX, reset on a stable drop).
+            # With --reconnect-interval: immediate on a genuine drop, else a flat ~interval wait -- so a
+            # synchronized mass-disconnect of a large fleet stays under the per-IP new-conns/min cap instead
+            # of storming (see plan_reconnect_sleep). Seq-gap resync above still skips this (backoff=False).
+            sleep_s, delay = plan_reconnect_sleep(
+                conn_start, time.monotonic(), delay, RECONNECT_BASE, RECONNECT_MAX, STABLE_AFTER,
+                reconnect_interval)
+            await asyncio.sleep(sleep_s)
 
 
 # ── Market lookup ────────────────────────────────────────────────────────────
-def _read_markets_cache(path):
-    """Return a parsed /v1/markets response from the launcher's shared cache file, or None.
-    Fail-open: any problem (missing / unreadable / corrupt / wrong shape) returns None so the caller
-    does a live fetch. Only a payload whose 'markets' is a list is trusted."""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if isinstance(data, dict) and isinstance(data.get("markets"), list):
-        return data
-    return None
-
-
-def _write_markets_cache(path, data):
-    """Best-effort ATOMIC write (temp + os.replace, so a reader never sees a partial file) to warm
-    the launcher's shared cache. Never raises: a cache-write failure must not break a working tool."""
-    tmp = f"{path}.{os.getpid()}.tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        os.replace(tmp, path)
-    except OSError:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-
-
 async def resolve_market(market: str):
     """Resolve a market (numeric id OR case-insensitive name) -> (marketId, displayName).
 
     Returns the CANONICAL display name -- it's reused as the WebSocket subscription
     `id` and in log filenames, where the server expects the name, not the id.
     """
-    data = _read_markets_cache(MARKETS_CACHE)
+    data = read_markets_cache(MARKETS_CACHE)
     if data is None:                        # cache miss -> live fetch, then warm the cache
         timeout = aiohttp.ClientTimeout(total=10)
         try:
@@ -379,16 +447,25 @@ async def resolve_market(market: str):
             raise SystemExit(f"wsorderbook: timed out fetching {MARKETS_URL}")
         except json.JSONDecodeError as e:
             raise SystemExit(f"wsorderbook: invalid JSON from markets API: {e}")
-        _write_markets_cache(MARKETS_CACHE, data)
-    data = require_dict(data, "markets")       # live-fetch path lacked the shape guard the cache path has
-    if not isinstance(data.get("markets"), list):   # unify with the cache path (_read_markets_cache requires a list)
-        raise SystemExit("wsorderbook: unexpected markets response shape (no 'markets' list)")
-    numeric = market.isdigit()
+        # Validate BEFORE caching/using (order: parse -> validate -> cache -> use): never write a
+        # malformed body into the shared markets cache, and don't let a non-dict reach .get below.
+        # (Cache hits are already safe -- read_markets_cache returns only a dict with a list 'markets'.)
+        data = require_dict(data, "markets", "wsorderbook")
+        if not isinstance(data.get("markets"), list):
+            raise SystemExit("wsorderbook: unexpected markets response shape (no 'markets' list)")
+        write_markets_cache(MARKETS_CACHE, data)
+    numeric = market.isdigit() and market.isascii()   # isascii guard: exotic Unicode digits (², ⑤) pass isdigit() but int() raises (matches showorderbook; MARKET_RE already blocks them, so this is defense-in-depth)
     up = market.upper()
     for m in data.get("markets", []):
-        if (numeric and str(m.get("marketId")) == str(int(market))) or \
+        if not isinstance(m, dict):
+            continue
+        try:
+            mid = int(m["marketId"])
+        except (KeyError, ValueError, TypeError):
+            continue                        # skip a malformed entry rather than crash on int() (matches showorderbook)
+        if (numeric and mid == int(market)) or \
            (not numeric and str(m.get("marketDisplayName", "")).upper() == up):
-            return int(m["marketId"]), str(m["marketDisplayName"])
+            return mid, str(m.get("marketDisplayName", ""))
     raise SystemExit(f"wsorderbook: market '{market}' not found.")
 
 
@@ -405,14 +482,21 @@ async def amain(args):
 
     print(f"[{args.market}] Resolving market …")
     market_id, market = await resolve_market(args.market)   # canonical display name
+    # A marketId outside the per-network port band would make PORT_BASE[net]+marketId land in ANOTHER network's
+    # band (mainnet 1000 -> 11000 = testnet's base) -- a reader aimed at that port would silently read a DIFFERENT
+    # network's book -- or, for a very large id, exceed 65535. Refuse rather than cross bands (mirrors the reader).
+    if not (0 <= market_id <= MAX_MARKET_ID):
+        raise SystemExit(f"wsorderbook: marketId {market_id} is outside the per-network port band "
+                         f"[0, {MAX_MARKET_ID}] -- its HTTP port would collide with another network's range "
+                         f"(PORT_BASE[{args.network}]={PORT_BASE[args.network]}).")
     port = PORT_BASE[args.network] + market_id
     print(f"[{market}] marketId={market_id} ({args.network})  →  HTTP port {port}")
 
     # One log per subscribed channel; unknown/malformed frames go to stdout.
     loggers = {
-        "l2OrderbookUpdates": setup_logger(f"wsob.l2.{market}", f"{args.log_dir}/wsorderbook{market}.log"),
-        "trades":             setup_logger(f"wsob.trades.{market}", f"{args.log_dir}/wstrades{market}.log"),
-        "oraclePrices":       setup_logger(f"wsob.oracle.{market}", f"{args.log_dir}/oraclePrices{market}.log"),
+        "l2OrderbookUpdates": setup_logger(f"wsob.l2.{market}", f"{args.log_dir}/wsorderbook{market}.log", args.max_bytes, args.log_backups),
+        "trades":             setup_logger(f"wsob.trades.{market}", f"{args.log_dir}/wstrades{market}.log", args.max_bytes, args.log_backups),
+        "oraclePrices":       setup_logger(f"wsob.oracle.{market}", f"{args.log_dir}/oraclePrices{market}.log", args.max_bytes, args.log_backups),
     }
 
     book = OrderBook()
@@ -423,13 +507,13 @@ async def amain(args):
     ]
     # Optional BBO → Redis publisher. redis-py is an OPTIONAL dependency: if it's not installed we skip
     # the bbo subscription entirely and this tool behaves exactly as before (HTTP orderbook only).
-    r = aioredis.from_url(REDIS_URL) if aioredis is not None else None
+    pub = BboPublisher(REDIS_URL) if aioredis is not None else None
     key = None
-    if r is not None:
+    if pub is not None:
         key = BBO_KEY_FMT.format(network=args.network, market=market)
         subscriptions.append({"type": "subscribe", "channel": "bbo", "id": market})
         print(f"[{market}] publishing BBO → redis '{key}' (TTL {BBO_TTL}s, heartbeat {HEARTBEAT}s)")
-    asyncio.create_task(ws_loop(args.url, subscriptions, book, loggers, args.timestamp, r, key))
+    asyncio.create_task(ws_loop(args.url, subscriptions, book, loggers, args.timestamp, pub, key, args.reconnect_interval))
 
     app = web.Application()
     app["book"] = book
@@ -453,21 +537,30 @@ def main():
                         help="log directory (default: /mnt/arcuslogs/<network>)")
     parser.add_argument("--url", default=None,
                         help="override the WebSocket URL (default: derived from the network)")
+    parser.add_argument("--max-bytes", type=positive_int, default=LOG_MAX_BYTES,
+                        help=f"rotating-file size cap in bytes, > 0 (default {LOG_MAX_BYTES})")
+    parser.add_argument("--log-backups", type=positive_int, default=LOG_BACKUP,
+                        help=f"rotating-file backup count, >= 1 (default {LOG_BACKUP})")
     parser.add_argument("--timestamp", action="store_true",
                         help="wrap each logged line as JSONL with a local receivedAt "
                              "(default: log the raw server frame)")
+    parser.add_argument("--reconnect-interval", type=positive_int, default=None,
+                        help="seconds between FAILED reconnect attempts (a genuine drop still reconnects "
+                             "immediately). Switches off exponential backoff. Use for a large single-IP fleet "
+                             "whose connections all drop at once (e.g. an unstable VPN) to stay under the "
+                             "per-IP new-conns/min cap. Default: exponential backoff.")
     net = parser.add_mutually_exclusive_group(required=True)
     net.add_argument("--testnet", dest="network", action="store_const", const="testnet",
-                     help="use the testnet server + WebSocket")
+                     help="use testnet")
     net.add_argument("--staging", dest="network", action="store_const", const="staging",
-                     help="use the staging server + WebSocket")
+                     help="use staging")
     net.add_argument("--mainnet", dest="network", action="store_const", const="mainnet",
-                     help="use the mainnet server + WebSocket")
+                     help="use mainnet")
     args = parser.parse_args()
     BASE_URL = NETWORKS[args.network]
     MARKETS_URL = f"{BASE_URL}/v1/markets"
-    WS_URL = BASE_URL.replace("https://", "wss://") + "/v1/ws"
-    MARKETS_CACHE = os.environ.get("ARCUS_MARKETS_CACHE") or MARKETS_CACHE_FMT.format(network=args.network)
+    WS_URL = ws_url(args.network)
+    MARKETS_CACHE = markets_cache_path(args.network)
     if args.url is None:
         args.url = WS_URL
     if args.log_dir is None:
