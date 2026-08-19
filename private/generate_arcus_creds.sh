@@ -41,7 +41,7 @@ if [ -z "$NETWORK" ]; then
   echo "error: one of --testnet, --staging, or --mainnet is required."; usage; exit 2
 fi
 
-# Write BESIDE this script (where arcus_common resolves arcus_creds_<network>.json), NOT in the
+# Write BESIDE this script (where arcus_common_private resolves arcus_creds_<network>.json), NOT in the
 # caller's cwd -- so it lands in the right place regardless of where the script is invoked from.
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || SCRIPT_DIR="."
 OUT="$SCRIPT_DIR/arcus_creds_${NETWORK}.json"
