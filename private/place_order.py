@@ -26,8 +26,7 @@ Market-order slippage guard:
 Signing (see ordersign.py): placeOrder is signed over the TYPED canonical payload.
 This is the only step that uses the Ed25519 API PRIVATE key.
 
-Resolves ordersign.py and arcus_creds.json relative to this script (the ~/info
-symlink dir), so it works from any working directory.
+Resolves ordersign.py and arcus_creds_<network>.json relative to this script (in private/), so it works from any working directory.
 """
 
 import argparse
@@ -38,16 +37,15 @@ import time
 import urllib.parse
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 
-# Resolve ordersign / arcus_common / arcus_creds.json relative to THIS script
-# (the ~/info symlink dir), so it works from any cwd and can't import a stray module.
+# Resolve ordersign / arcus_common_private / arcus_creds_<network>.json relative to THIS script
+# (in private/), so it works from any cwd and can't import a stray module.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
 import ordersign
 from ordersign import Signer
-from arcus_common import (add_network_args, call, check_order_response, clock_delta_ns, dec,
-                          describe_error, load_creds, positive_decimal, resolve_market,
-                          select_network, to_quantums, to_ticks, validate_client_id)
+from arcus_common_private import (
+    add_network_args, call, check_order_response, clamp_to_mark_cap, clock_delta, dec, load_creds, positive_decimal, resolve_market, round_to_increment, select_network, to_quantums, to_ticks, validate_client_id)
 
 MAX_SLIPPAGE = Decimal("0.03")          # 3% of mid, for market orders
 PRICE_BUFFER = Decimal("0.01")          # normal: pad the bound +/-1% past the worst level
@@ -63,24 +61,7 @@ TIFS = {"GTT": ordersign.TIF_GTC, "FOK": ordersign.TIF_FOK,
 GOOD_TIL_DAYS = 365
 
 
-def clock_delta():
-    """Server-minus-local clock offset (ns) from /v1/time; 0 (use local clock) if
-    it's unavailable -- a /v1/time hiccup shouldn't block an order, and the 365-day
-    expiry clears the 1-month minimum regardless of small drift."""
-    try:
-        return clock_delta_ns()
-    except Exception as e:
-        print(f"warning: /v1/time unavailable ({describe_error(e)}); using local clock.",
-              file=sys.stderr)
-        return 0
-
-
 # ── place_order-specific helpers ──────────────────────────────────────────────
-def round_to_increment(value, increment, rounding):
-    inc = Decimal(increment)
-    return (value / inc).to_integral_value(rounding=rounding) * inc
-
-
 def to_step(qty, step_size):
     """Round a base-asset quantity DOWN to a valid step multiple (never overspends)."""
     q = round_to_increment(qty, step_size, ROUND_FLOOR)
@@ -178,21 +159,44 @@ def main():
     signer = Signer.from_private_key_hex(creds["api_private_key"])
 
     # --- Resolve market (by id or case-insensitive name) -> canonical name ----
-    markets = call("GET", "/v1/markets")["markets"]
+    resp = call("GET", "/v1/markets")
+    if not isinstance(resp, dict) or not isinstance(resp.get("markets"), list):
+        raise SystemExit("place_order: unexpected /v1/markets response (expected an object with a 'markets' list).")
+    markets = resp["markets"]
     mkt = resolve_market(markets, args.market)
     if mkt is None:
         raise SystemExit(f"Unknown market {args.market!r}.")
-    market_id = int(mkt["marketId"])
-    tick_size, step_size = mkt["tickSize"], mkt["stepSize"]
-    args.market = mkt["marketDisplayName"]   # canonicalize (l2OrderBook path needs it)
+    try:
+        market_id = int(mkt["marketId"])
+        tick_size, step_size = mkt["tickSize"], mkt["stepSize"]
+        dt, ds = dec(tick_size), dec(step_size)
+        if dt is None or ds is None or dt <= 0 or ds <= 0:   # require FINITE and > 0: a 0 increment -> DivisionByZero in
+            raise ValueError                                  # round_to_increment; a NEGATIVE one -> negative signed ticks/
+                                                              # quantums (ordersign rejects only a ZERO divisor). Matches the
+                                                              # cache/market-maker finite-positive tick/step validation.
+        args.market = mkt["marketDisplayName"]   # canonicalize (l2OrderBook path needs it)
+    except (KeyError, ValueError, TypeError):
+        raise SystemExit(f"place_order: market {args.market!r} has incomplete/malformed metadata "
+                         f"(marketId / tickSize>0 / stepSize>0 / marketDisplayName).")
     usd_mode = args.quantityusd is not None
 
     # --- Determine the order's quantity and price -----------------------------
     if is_market:
         ob = call("GET", f"/v1/l2OrderBook/{urllib.parse.quote(args.market)}")
+        if not isinstance(ob, dict):
+            raise SystemExit(f"{args.market}: unexpected /v1/l2OrderBook response (not a JSON object).")
         bids, asks = ob.get("bids", []), ob.get("asks", [])
         if not bids or not asks:
             raise SystemExit(f"{args.market}: order book has no two-sided liquidity.")
+        try:                                    # every level must be a [finite-positive price, finite-positive size]
+            for lv in (*bids, *asks):           # PAIR. Bare Decimal() ACCEPTS "NaN"/"Infinity"/negatives -- those would
+                if not isinstance(lv, (list, tuple)) or len(lv) != 2:   # flow into mid/slippage and FAIL the slippage
+                    raise ValueError("level is not a 2-element list")    # guard OPEN (NaN>MAX and negative>MAX are both
+                p, s = Decimal(lv[0]), Decimal(lv[1])                    # False). is_finite() short-circuits the > 0
+                if not (p.is_finite() and p > 0 and s.is_finite() and s > 0):   # so NaN never reaches the comparison.
+                    raise ValueError("level price/size must be finite and positive")
+        except (ArithmeticError, TypeError, ValueError):
+            raise SystemExit(f"{args.market}: malformed order book from /v1/l2OrderBook (level not a finite-positive [price, size] pair).")
         # Sort defensively (don't trust the server's ordering): asks ascending,
         # bids descending -> best bid/ask are index 0; walk in consume order.
         asks = sorted(asks, key=lambda lv: Decimal(lv[0]))
@@ -218,6 +222,10 @@ def main():
               f"est avg fill={avg_fill:.6f}  slippage={slippage * 100:.2f}%  worst level={worst_price}")
         if not enough:
             print(f"  WARNING: book only covers {filled} of {qty}; an IOC order will partially fill.")
+        if not slippage.is_finite():            # defense-in-depth: a non-finite slippage means the pricing is broken
+            raise SystemExit(                   # (malformed book). NEVER place -- not even with --force, since NaN>MAX
+                f"{args.market}: computed slippage is non-finite "   # is False and would silently fail the guard OPEN.
+                f"(mid={mid}, avg_fill={avg_fill}) -- book is malformed, not placing.")
         if slippage > MAX_SLIPPAGE and not args.force:
             raise SystemExit(
                 f"  Slippage {slippage * 100:.2f}% exceeds {MAX_SLIPPAGE * 100:.0f}% limit "
@@ -242,6 +250,28 @@ def main():
         # partial/no fills. The 1%/9% buffers are far wider than one tick, so this can't breach the
         # API's 10%-of-mark cap.)
         bound = round_to_increment(target, tick_size, ROUND_CEILING if args.side == "BUY" else ROUND_FLOOR)
+        if args.force:
+            # The --force bound is mark-based; keep it within the venue's 10%-of-mark cap so a coarse tick
+            # rounding the 9% bound away can't push it past 10% -> order rejected.
+            bound = clamp_to_mark_cap(bound, mark, tick_size, args.side == "BUY")
+        else:
+            # The non-force bound is BOOK-relative (worst level +/-1%), but the venue STILL checks it against the
+            # 10%-of-mark cap. A book dislocated >10% from markPrice would be REJECTED on submit -> refuse up front
+            # and point to --force (a mark-based bound) rather than sending a doomed order (docs' "--force" case).
+            # markPrice unavailable -> can't check -> let the venue decide (unchanged).
+            mk = dec(mkt.get("markPrice"))
+            if mk is not None and mk > 0 and abs(bound - mk) > mk * Decimal("0.10"):
+                raise SystemExit(
+                    f"  {args.market}: order-book bound {bound} is >10% off markPrice {mk} (the venue's market-order "
+                    f"cap); the book is dislocated from mark. Re-run with --force for a mark-based bound.")
+        # A SELL floor can tick-round DOWN to 0 when the price is within ~1 tick of tickSize (target < tick),
+        # leaving a MARKET SELL with NO protective floor (0 = accept any fill). Also backstops a 0 mark/mid.
+        # There is no safe protective MARKET bound here -- refuse; the operator can place a LIMIT order.
+        if bound <= 0:
+            raise SystemExit(
+                f"  protective bound rounded to {bound} (<= 0): {args.market} price is within ~1 tick of "
+                f"tickSize {tick_size}, so a MARKET {args.side} would carry no protective bound. "
+                f"Refusing -- place a LIMIT order instead.")
         print(f"  bound={bound:f}  ({label})")
 
         order_type = "MARKET"
