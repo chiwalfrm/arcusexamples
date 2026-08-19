@@ -16,43 +16,20 @@ venue then falls back to the entry price for its notional / PnL math).
 
 import argparse
 import csv
-import json
+import os
 import re
 import sys
-import urllib.error
 import urllib.parse
-import urllib.request
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
+from arcus_common_public import NETWORKS, dec, get_json_dict, market_id_key, num   # shared public helpers (formerly local copies)
 
-NETWORKS = {
-    "testnet": "https://api.testnet.arcus.xyz",
-    "staging": "https://api.staging.arcus.xyz",
-    "mainnet": "https://api.arcus.xyz",       # live 2026-06-25 (reads only for now)
-}
-BASE = None   # set in main() from the required --testnet/--staging selector
+BASE = None   # set in main() from the required --testnet/--staging/--mainnet selector
 ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 
-def dec(value):
-    """Parse a decimal string -> Decimal, or None if not numeric."""
-    try:
-        return Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
-        return None
-
-
-def num(value, decimals=2):
-    """Decimal-string -> fixed-precision, comma-grouped; '-' if not numeric.
-
-    Uses Decimal (not float) -- sizes/PnL/notional are decimal strings, so this
-    avoids binary floating-point rounding artifacts.
-    """
-    d = dec(value)
-    return f"{d:,.{decimals}f}" if d is not None else "-"
-
-
 def funding_of(p):
-    return (p.get("cumulativeFunding") or {}).get("sinceOpen")
+    cf = p.get("cumulativeFunding")
+    return cf.get("sinceOpen") if isinstance(cf, dict) else None
 
 
 def mark_str(p):
@@ -61,14 +38,6 @@ def mark_str(p):
     if d is None or d == 0:
         return "-"
     return num(p.get("oraclePx"))
-
-
-def market_id_key(p):
-    """Sort key by NUMERIC marketId (so 2 < 10); missing/non-numeric sort last."""
-    try:
-        return (0, int(p.get("marketId")))
-    except (TypeError, ValueError):
-        return (1, 0)
 
 
 # (header, alignment, value-getter -> display string). Widths are sized to data.
@@ -89,31 +58,15 @@ COLS = [
 def fetch_positions(address):
     """GET /v1/positions -> dict keyed by marketId; clean CLI errors on failure."""
     query = urllib.parse.urlencode({"address": address})
-    req = urllib.request.Request(f"{BASE}/v1/positions?{query}", method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.loads(r.read() or b"{}")
-    except urllib.error.HTTPError as e:
-        try:
-            msg = json.loads(e.read() or b"{}").get("error", "")
-        except (ValueError, TypeError):
-            msg = ""
-        raise SystemExit(f"HTTP {e.code}: {msg or 'request failed'}")
-    except urllib.error.URLError as e:
-        raise SystemExit(f"display_positions: could not reach {BASE}: {e.reason}")
-    except (TimeoutError, OSError) as e:
-        raise SystemExit(f"display_positions: network error: {e}")
-    except json.JSONDecodeError as e:
-        raise SystemExit(f"display_positions: invalid JSON from server: {e}")
-
-    if not isinstance(data, dict):          # a non-object 200 body would crash data.get below
-        raise SystemExit("display_positions: unexpected response (expected a JSON object).")
+    # Shared retrying reader: Retry-After/backoff on 429 (incl. Cloudflare 1015) + 5xx, and require_dict
+    # (so a non-object 2xx body is a clean error, not a .get AttributeError) -- robust for cron/ops.
+    data = get_json_dict(f"{BASE}/v1/positions?{query}", "positions", "display_positions")
     positions = data.get("positions")
     if positions is None:
         return {}
     if not isinstance(positions, dict):
         raise SystemExit("display_positions: unexpected 'positions' shape (expected object).")
-    return positions
+    return {mid: p for mid, p in positions.items() if isinstance(p, dict)}   # drop non-dict values so downstream .get() can't crash
 
 
 def main():
@@ -175,4 +128,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        # A downstream reader closed early (e.g. `... | head`). Point stdout at devnull so the interpreter's
+        # shutdown flush can't re-raise BrokenPipeError, then exit cleanly -- this tool is meant for piping.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except Exception:
+            pass
+        sys.exit(0)
