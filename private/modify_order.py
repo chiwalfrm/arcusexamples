@@ -28,7 +28,7 @@ Signing (see ordersign.py): modifyOrder is the TYPED payload op=3
   immutable echo; goodTilTime/reduceOnly/side/timeInForce are all part of the signature.
 Every replacement carries a fresh goodTilTime >= 1 month out (365 days).
 
-Resolves ordersign.py / marketcache.py / arcus_creds_<network>.json relative to this script.
+Resolves ordersign.py / arcus_redis.py / arcus_creds_<network>.json relative to this script.
 """
 
 import argparse
@@ -41,11 +41,11 @@ import urllib.parse
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
-import marketcache
+import arcus_redis as marketcache
 import ordersign
 from ordersign import Signer
-from arcus_common import (add_network_args, call, check_order_response, load_creds, positive_decimal,
-                          select_network, to_quantums, to_ticks, validate_client_id)
+from arcus_common_private import (add_network_args, call, check_order_response, dec, fetch_open_orders, load_creds, positive_decimal,
+                          select_network, server_clock_shim, to_quantums, to_ticks, validate_client_id)
 
 TIFS = ("GTT", "IOC", "FOK", "ALO")
 SIDES = {"BUY": ordersign.SIDE_BUY, "SELL": ordersign.SIDE_SELL}
@@ -112,7 +112,9 @@ def main():
 
     match = None
     if need_lookup:
-        orders = call("GET", f"/v1/openOrders?{query}").get("orders", [])
+        # FAIL CLOSED on an unreadable openOrders body (non-dict / missing / non-list 'orders'): order state is
+        # UNKNOWN, so we must not read it as "no matching order" (line below) or traceback on `.get`/iteration.
+        orders = fetch_open_orders(query, "modify_order")
         if args.orderid:
             match = next((o for o in orders if o.get("orderId") == args.orderid), None)
         else:
@@ -142,8 +144,8 @@ def main():
                 raise SystemExit(f"--clientid {args.client_id!r} was given, but the order has NO clientId.")
             raise SystemExit(f"--clientid {args.client_id!r} does not match the order's {client_echo!r}.")
         if args.market is not None:
-            ok = (str(args.market) == str(match.get("marketId")) if args.market.isdigit()
-                  else args.market.upper() == str(actual_market).upper())
+            ok = (str(int(args.market)) == str(match.get("marketId")) if args.market.isdigit()
+                  else args.market.upper() == str(actual_market).upper())   # int() normalizes "01"==1 (matches cancel_order)
             if not ok:
                 raise SystemExit(f"--market {args.market!r} does not match the order's "
                                  f"{actual_market!r} (id {match.get('marketId')}).")
@@ -159,6 +161,23 @@ def main():
         client_echo = args.client_id                   # may be None -> order must have no clientId
         market_name, side, tif, reduce_only = args.market, args.side, args.tif, args.reduce_only
 
+    # orderId is REQUIRED to sign a modify (it identifies the resting order). The lookup path takes it from the
+    # matched /v1/openOrders row, which can be missing/null on a malformed body -> fail CLEAN here rather than a
+    # confusing downstream signing error. (The fast path's order_id is the user-supplied --orderid, always present.)
+    if not order_id:
+        raise SystemExit("modify_order: the matched order has no usable orderId; cannot modify "
+                         "(the /v1/openOrders row is missing it).")
+
+    # In the LOOKUP path side/tif come straight from the resting order (openOrders) and are otherwise
+    # unvalidated: unless the user passed --side/--tif, the mismatch check above never runs, so an unexpected
+    # value (or None if the field is missing) would KeyError in SIDES[side]/TIF_INT[tif] at signing. Fail clean
+    # instead. (The fast path's side/tif come from argparse choices, so this is a no-op there.)
+    if side not in SIDES:
+        raise SystemExit(f"modify_order: order has an unrecognized side {side!r} (expected one of {sorted(SIDES)}).")
+    if tif not in TIF_INT:
+        raise SystemExit(f"modify_order: order has an unrecognized timeInForce {tif!r} "
+                         f"(expected one of {sorted(TIF_INT)}).")
+
     # Price/quantity: user value if given, else keep the order's current value (lookup only).
     # For quantity, preserve REMAINING (still-open) size, NOT originalSize -- modify is an atomic
     # cancel+replace and `quantity` is the replacement order's full resting size, so re-using
@@ -166,6 +185,13 @@ def main():
     # increasing exposure). remainingSize == originalSize for an unfilled order, so no change there.
     price = str(args.price) if args.price is not None else str(match.get("price"))
     quantity = str(args.quantity) if args.quantity is not None else str(match.get("remainingSize"))
+    # The order's price/remainingSize come straight from /v1/openOrders; a non-numeric or non-finite
+    # value (Infinity/NaN) would else reach ordersign's int(rounded) as an uncaught OverflowError while
+    # SIGNING. Validate here (dec() rejects non-finite) -- the signing lib stays untouched.
+    dp, dq = dec(price), dec(quantity)
+    if dp is None or dq is None or dp <= 0 or dq <= 0:   # finite AND > 0: a non-positive remainingSize means the order
+        raise SystemExit(f"modify_order: order price/size must be a finite POSITIVE number "   # is fully filled/gone; a
+                         f"(price={price!r}, size={quantity!r}).")                              # 0/neg price is invalid
 
     # Market metadata (Redis-cached) -> tick/step; exact-multiple conversion.
     try:
@@ -184,9 +210,10 @@ def main():
     price_ticks = to_ticks(price, mkt["tickSize"])
     quantity_quantums = to_quantums(quantity, mkt["stepSize"])
 
-    # Replacement order needs a fresh goodTilTime >= 1 month out (local clock; 365d
-    # clears the minimum regardless of small drift -- and modify's X-Timestamp is
-    # generated inside ordersign, so /v1/time correction couldn't help it anyway).
+    # Replacement order needs a fresh goodTilTime >= 1 month out (local clock; 365d clears the minimum
+    # regardless of small drift). modify's X-Timestamp IS generated inside ordersign (sign_modify_order's
+    # internal time.time_ns), but the sign call below is wrapped in server_clock_shim() so /v1/time DOES
+    # align that X-Timestamp -- a drifted clock can't push it outside the server's +/-30 s auth window.
     good_til_us = str(int(time.time() * 1_000_000) + GOOD_TIL_DAYS * 86_400 * 1_000_000)
 
     kept = [n for n, v in (("price", args.price), ("quantity", args.quantity)) if v is None]
@@ -197,13 +224,16 @@ def main():
     print(f"  fields from: {src}" + (f"; kept current {', '.join(kept)}" if kept else ""))
 
     # --- Sign the typed modify payload (op=3), then POST ----------------------
-    headers = signer.sign_modify_order(
-        address=address, account_index=account_index, market_id=market_id,
-        price_ticks=price_ticks, quantity_quantums=quantity_quantums,
-        good_til_time_ns_=ordersign.good_til_time_ns(good_til_us),
-        reduce_only=reduce_only, side=SIDES[side], time_in_force=TIF_INT[tif],
-        order_id=order_id, client_id=client_echo,
-    )
+    # server_clock_shim(): sign_modify_order mints its X-Timestamp from an internal time.time_ns(); the shim
+    # server-aligns it so a drifted local clock can't 401 the modify (parity with place_order/close_position).
+    with server_clock_shim():
+        headers = signer.sign_modify_order(
+            address=address, account_index=account_index, market_id=market_id,
+            price_ticks=price_ticks, quantity_quantums=quantity_quantums,
+            good_til_time_ns_=ordersign.good_til_time_ns(good_til_us),
+            reduce_only=reduce_only, side=SIDES[side], time_in_force=TIF_INT[tif],
+            order_id=order_id, client_id=client_echo,
+        )
     body = {
         "address": address, "accountIndex": account_index, "marketId": market_id,
         "orderId": order_id, "side": side, "timeInForce": tif,
