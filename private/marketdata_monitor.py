@@ -141,9 +141,10 @@ EXCLUDED_FIELDS = {
 
 # Fields NOT saved to the on-disk field-history files (written under --update). Kept SEPARATE from
 # EXCLUDED_FIELDS (which governs the Redis change DIFF) so saving and diffing can be tuned
-# independently -- e.g. save a field's history while ignoring it in the diff, or vice versa. Starts
-# identical to EXCLUDED_FIELDS; edit THIS set alone to diverge later. Note: file-saving uses this set
-# unconditionally -- --compare-all affects only the diff, never what gets saved.
+# independently -- e.g. save a field's history while ignoring it in the diff, or vice versa. Currently
+# EMPTY -- EVERY field is saved to history; uncomment the set(EXCLUDED_FIELDS) line below to instead skip
+# saving the same live fields the diff ignores. Note: file-saving uses this collection unconditionally --
+# --compare-all affects only the diff, never what gets saved.
 #DONTSAVE_FIELDS = set(EXCLUDED_FIELDS)
 DONTSAVE_FIELDS = {}
 
