@@ -16,7 +16,7 @@ import sys
 import time
 
 import websockets
-from arcus_common_public import CACHE_TTL, REDIS_URL, dec, describe_error, emit as _emit, log_ts, make_publisher, now_iso, plan_reconnect_sleep, positive_int, setup_logger, ws_url   # shared public helpers (formerly local copies)
+from arcus_common_public import SUB_ERR_LIMIT, CACHE_TTL, REDIS_URL, dec, describe_error, emit as _emit, log_ts, make_publisher, now_iso, plan_reconnect_sleep, positive_int, SubscriptionError, setup_logger, write_pidfile, ws_url   # shared public helpers (formerly local copies)
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -95,6 +95,12 @@ async def handle_message(raw, loggers, add_ts, pub, network, state):
     if not isinstance(msg, dict):          # valid JSON but not an object (bare array/number) -> STDOUT, keep reading
         print(raw)
         return
+    # Server subscription/request error (channel-less frame with an `error` object or status >= 400): raise so
+    # ws_loop reconnects instead of sitting on a dead subscription. Channel-less gate => real frames never match.
+    if msg.get("channel") is None and (isinstance(msg.get("error"), dict)
+                                       or (isinstance(msg.get("status"), int) and msg["status"] >= 400)):
+        err = msg.get("error") if isinstance(msg.get("error"), dict) else {}
+        raise SubscriptionError(err.get("message") or f"status {msg.get('status')}: {err or msg}")
 
     logger = loggers.get(msg.get("channel"))
     if logger is None:                        # not a subscribed channel -> stdout
@@ -116,6 +122,7 @@ async def handle_message(raw, loggers, add_ts, pub, network, state):
 # ── WebSocket loop ───────────────────────────────────────────────────────────
 async def ws_loop(url, subscriptions, loggers, add_ts, pub, network, reconnect_interval=None):
     delay = RECONNECT_BASE
+    sub_errs = 0                               # consecutive subscription rejections; reset once a connection is stable
     while True:
         conn_start = None
         state = {"markets": None, "last_pub": 0.0}   # last-good (key, blob) + monotonic publish time, per-connection
@@ -145,6 +152,13 @@ async def ws_loop(url, subscriptions, loggers, add_ts, pub, network, reconnect_i
                     # No redis: the original loop, untouched.
                     async for raw in ws:
                         await handle_message(raw, loggers, add_ts, None, network, state)
+        except SubscriptionError as e:
+            # Reconnectable, not fatal: resubscribe on a fresh socket with the normal backoff. Give up only
+            # after SUB_ERR_LIMIT rejections in a row with no stable connection between (a genuinely bad sub).
+            sub_errs += 1
+            if sub_errs >= SUB_ERR_LIMIT:
+                raise SystemExit(f"wsexchange: subscription rejected {sub_errs}x in a row, giving up: {e}")
+            print(f"[{log_ts()}] [sub error] {e} — resubscribing (attempt {sub_errs}, with backoff)", file=sys.stderr)
         except websockets.ConnectionClosedOK:
             print(f"[{log_ts()}] [ws] connection closed — reconnecting", file=sys.stderr)   # CLEAN close (redis path: ws.recv() raises this) -> NOT an error
         except Exception as e:
@@ -156,6 +170,8 @@ async def ws_loop(url, subscriptions, loggers, add_ts, pub, network, reconnect_i
         # With --reconnect-interval: immediate on a genuine drop, else a flat ~interval wait -- so a
         # synchronized mass-disconnect of a large fleet stays under the per-IP new-conns/min cap (see
         # plan_reconnect_sleep).
+        if conn_start is not None and time.monotonic() - conn_start >= STABLE_AFTER:
+            sub_errs = 0                        # the connection proved stable => subscriptions are fine
         sleep_s, delay = plan_reconnect_sleep(
             conn_start, time.monotonic(), delay, RECONNECT_BASE, RECONNECT_MAX, STABLE_AFTER,
             reconnect_interval)
@@ -231,6 +247,7 @@ def main():
         args.url = ws_url(args.network)
     if args.log_dir is None:
         args.log_dir = os.path.join(LOG_BASE, args.network)
+    write_pidfile(args.log_dir, "wsexchange")   # liveness marker: monitor checks the PID is alive
     try:
         asyncio.run(amain(args))
     except KeyboardInterrupt:
