@@ -5,7 +5,7 @@ Input is the --condensed output of display_fills.py (CSV), e.g.:
     python3 display_fills.py 0xADDR --market BTC-USD --limit unlimited --condensed --mainnet > fills.txt
     python3 calculate_pnl.py fills.txt --mainnet
 The file (or stdin: pass '-' or pipe) has one fill per line in display_fills CONDENSED_KEYS order:
-    createdAt,marketDisplayName,side,size,price,fee,role,closedPnl,positionEffect,tradeId,orderId
+    createdAt,marketDisplayName,side,size,price,fee,role,closedPnl,positionEffect,tradeId,orderId,liquidationMethod,liquidatedUser
 Only createdAt(0) marketDisplayName(1) side(2) size(3) price(4) fee(5) are used; a --header row
 is skipped. Rows are ordered OLDEST-first (by createdAt, epoch microseconds) for FIFO matching.
 (arcus fills also carry the API's own per-fill closedPnl, but this tool computes FIFO independently
@@ -40,7 +40,7 @@ import sys
 from collections import deque
 from decimal import Decimal
 from functools import partial
-from arcus_common_public import NETWORKS, dec, get_json_dict   # shared public helpers (formerly local copies)
+from arcus_common_public import add_network_args, run_pipe_safe, NETWORKS, dec, get_json_dict   # shared public helpers (formerly local copies)
 
 get_json = partial(get_json_dict, prog="calculate_pnl")   # get_json + require_dict, this tool's prog
 
@@ -93,73 +93,157 @@ def print_human(market, remaining, avg, realized, latest, unrealized, fees, volu
     print()
 
 
+def _parse_fill(parts, lineno, want_market):
+    """Parse ONE CSV row -> a fill dict, or None to skip (empty / --header / malformed / off-market /
+    non-positive size or price). Warns to stderr on a genuinely malformed row (never on a header or an
+    off-market filter). createdAt is kept as an int (epoch microseconds)."""
+    if not parts or not any(c.strip() for c in parts):
+        return None
+    if len(parts) < MIN_FIELDS:
+        print(f"calculate_pnl: line {lineno}: too few fields ({len(parts)} < {MIN_FIELDS}), skipping",
+              file=sys.stderr)
+        return None
+    side = parts[C_SIDE].strip().upper()
+    size, price, fee = dec(parts[C_SIZE]), dec(parts[C_PRICE]), dec(parts[C_FEE])
+    market, created_s = parts[C_MARKET].strip(), parts[C_CREATED].strip()
+    if side not in ("BUY", "SELL") or size is None or price is None:
+        if parts[C_CREATED].strip().lower() == "createdat":     # a --header row -> skip quietly
+            return None
+        print(f"calculate_pnl: line {lineno}: unparseable side/size/price, skipping", file=sys.stderr)
+        return None
+    if want_market and market != want_market:
+        return None
+    # A real trade has size > 0 AND price > 0. dec() accepts "0"/"-5" (finite but <= 0), which would
+    # corrupt FIFO: a negative size FLIPS the fill's side (q = size for a BUY), and a 0/negative price
+    # gives garbage realized PnL + volume. Skip non-positive rows (size/price are both non-None here).
+    if size <= 0 or price <= 0:
+        print(f"calculate_pnl: line {lineno}: non-positive size/price ({size}/{price}), skipping",
+              file=sys.stderr)
+        return None
+    try:
+        created = int(created_s)
+    except (TypeError, ValueError):
+        created = -1                                            # unparseable time -> sort oldest
+    return {"created": created, "market": market, "side": side,
+            "size": size, "price": price, "fee": fee if fee is not None else Decimal(0)}
+
+
 def read_fills(fh, want_market):
-    """Parse CSV rows into fill dicts. Skips a header row and warns on malformed rows. Returns
-    (fills, markets_seen). createdAt is kept as an int (epoch microseconds) for sorting."""
+    """BUFFERED parse (stdin / the non-monotonic fallback): CSV rows -> (fills list, markets_seen).
+    O(rows) memory -- the streaming path (reversed_lines + compute_pnl) avoids this for a seekable file."""
     fills, markets = [], set()
     for lineno, parts in enumerate(csv.reader(fh), 1):
-        if not parts or not any(c.strip() for c in parts):
-            continue
-        if len(parts) < MIN_FIELDS:
-            print(f"calculate_pnl: line {lineno}: too few fields "
-                  f"({len(parts)} < {MIN_FIELDS}), skipping", file=sys.stderr)
-            continue
-        side = parts[C_SIDE].strip().upper()
-        size, price, fee = dec(parts[C_SIZE]), dec(parts[C_PRICE]), dec(parts[C_FEE])
-        market, created_s = parts[C_MARKET].strip(), parts[C_CREATED].strip()
-        if side not in ("BUY", "SELL") or size is None or price is None:
-            if parts[C_CREATED].strip().lower() == "createdat":     # a --header row -> skip quietly
-                continue
-            print(f"calculate_pnl: line {lineno}: unparseable side/size/price, skipping",
-                  file=sys.stderr)
-            continue
-        if want_market and market != want_market:
-            continue
-        # A real trade has size > 0 AND price > 0. dec() accepts "0"/"-5" (finite but <= 0), which would
-        # corrupt FIFO: a negative size FLIPS the fill's side (q = size for a BUY), and a 0/negative price
-        # gives garbage realized PnL + volume. Skip non-positive rows (size/price are both non-None here).
-        if size <= 0 or price <= 0:
-            print(f"calculate_pnl: line {lineno}: non-positive size/price ({size}/{price}), skipping",
-                  file=sys.stderr)
-            continue
-        try:
-            created = int(created_s)
-        except (TypeError, ValueError):
-            created = -1                                            # unparseable time -> sort oldest
-        markets.add(market)
-        fills.append({"created": created, "market": market, "side": side,
-                      "size": size, "price": price, "fee": fee if fee is not None else Decimal(0)})
+        f = _parse_fill(parts, lineno, want_market)
+        if f is not None:
+            fills.append(f)
+            markets.add(f["market"])
     return fills, markets
 
 
-def fifo_pnl(fills):
-    """`fills` OLDEST-first. Match opposing fills FIFO. Returns
-    (realized, remaining_signed, avg_open_price). avg is 0 when flat."""
-    lots = deque()                 # each: [signed_qty, price]; all entries share the position's sign
-    realized = Decimal(0)
-    for f in fills:
-        q = f["size"] if f["side"] == "BUY" else -f["size"]
-        p = f["price"]
-        # Close against opposing lots FIFO until this fill is exhausted or the side flips.
-        while q != 0 and lots and (lots[0][0] > 0) != (q > 0):
-            lot = lots[0]
-            close = min(abs(lot[0]), abs(q))
-            if lot[0] > 0:
-                realized += (p - lot[1]) * close     # long lot closed by a sell
-            else:
-                realized += (lot[1] - p) * close     # short lot closed by a buy
-            lot[0] -= close if lot[0] > 0 else -close
-            q -= close if q > 0 else -close
-            if lot[0] == 0:
-                lots.popleft()
-        if q != 0:                                   # leftover opens/extends the position
+def parsed_fills(line_iter, want_market):
+    """GENERATOR: parse a stream of CSV lines -> fill dicts (skipping bad rows). Feeds compute_pnl so a
+    huge file is processed one row at a time instead of being buffered into a list."""
+    for lineno, parts in enumerate(csv.reader(line_iter), 1):
+        f = _parse_fill(parts, lineno, want_market)
+        if f is not None:
+            yield f
+
+
+def scan_markets(path, want_market):
+    """Cheap FORWARD pass -> the set of distinct markets among trade rows (O(#markets) memory, no dicts,
+    no warnings). Only needed to auto-detect the market when --market is not given."""
+    markets = set()
+    with open(path) as fh:
+        for parts in csv.reader(fh):
+            if len(parts) < MIN_FIELDS:
+                continue
+            if parts[C_SIDE].strip().upper() not in ("BUY", "SELL"):   # skips header + malformed quietly
+                continue
+            m = parts[C_MARKET].strip()
+            if not want_market or m == want_market:
+                markets.add(m)
+    return markets
+
+
+def reversed_lines(path, chunk=1 << 20):
+    """Yield the lines of `path` from LAST to FIRST without loading the whole file (bounded memory: one
+    ~chunk block at a time). A newest-first display_fills file read last-line-first is OLDEST-first --
+    exactly the order FIFO needs -- so PnL streams in O(open position) memory, not O(file)."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        pos = f.tell()
+        tail = b""
+        while pos > 0:
+            step = min(chunk, pos)
+            pos -= step
+            f.seek(pos)
+            block = f.read(step) + tail
+            parts = block.split(b"\n")
+            tail = parts[0]                 # parts[0] may be a partial line -> hold it for the next (earlier) block
+            for ln in reversed(parts[1:]):
+                yield ln.decode("utf-8", "replace")
+        if tail:
+            yield tail.decode("utf-8", "replace")
+
+
+def resolve_market(markets):
+    """Pick the single market from the detected set, or a clean error (mirrors the original main)."""
+    if len(markets) == 1:
+        return next(iter(markets))
+    if not markets:
+        raise SystemExit("calculate_pnl: no fills parsed from input.")
+    raise SystemExit("calculate_pnl: input mixes multiple markets "
+                     f"({', '.join(sorted(markets))}); pass --market to pick one.")
+
+
+def fifo_step(lots, realized, q, p):
+    """Apply one signed fill (qty q at price p) to the FIFO `lots` deque; return the updated realized PnL.
+    Closes opposing lots oldest-first; a leftover that extends the position COLLAPSES into the last lot when
+    it shares that lot's price -- a run of same-price fills is ONE entry, not many, so the deque stays bounded
+    by the number of open price levels, not the fill count. Output is identical to per-fill lots (adjacent
+    same-price lots are indistinguishable to FIFO)."""
+    while q != 0 and lots and (lots[0][0] > 0) != (q > 0):
+        lot = lots[0]
+        close = min(abs(lot[0]), abs(q))
+        realized += (p - lot[1]) * close if lot[0] > 0 else (lot[1] - p) * close
+        lot[0] -= close if lot[0] > 0 else -close
+        q -= close if q > 0 else -close
+        if lot[0] == 0:
+            lots.popleft()
+    if q != 0:                                   # leftover opens/extends the position (same sign as any lots)
+        if lots and lots[-1][1] == p:            # same-price run -> merge into the last lot instead of appending
+            lots[-1][0] += q
+        else:
             lots.append([q, p])
+    return realized
+
+
+class NotMonotonic(Exception):
+    """compute_pnl raises this when createdAt is not non-decreasing -- the input is NOT in display_fills
+    (newest-first) order, so a backward stream can't assume oldest-first. The caller falls back to a
+    buffered sort (correct for any input)."""
+
+
+def compute_pnl(fills, guard_monotonic):
+    """ONE pass over `fills` (an iterable of fill dicts, OLDEST-first) computing FIFO realized PnL +
+    fee/volume totals with O(1) memory aside from the open-lot deque. Returns
+    (realized, remaining, avg, total_fees, total_volume, market, n). Raises NotMonotonic when
+    guard_monotonic and a createdAt decreases (input not newest-first)."""
+    lots = deque()                              # each: [signed_qty, price]; all entries share the position's sign
+    realized = total_fees = total_volume = Decimal(0)
+    market, n, prev = None, 0, None
+    for f in fills:
+        c = f["created"]
+        if guard_monotonic and prev is not None and c < prev:
+            raise NotMonotonic
+        prev, market, n = c, f["market"], n + 1
+        q = f["size"] if f["side"] == "BUY" else -f["size"]
+        realized = fifo_step(lots, realized, q, f["price"])
+        total_fees += f["fee"]
+        total_volume += f["size"] * f["price"]
     remaining = sum((lot[0] for lot in lots), Decimal(0))
-    if remaining != 0:
-        avg = sum((lot[0] * lot[1] for lot in lots), Decimal(0)) / remaining
-    else:
-        avg = Decimal(0)
-    return realized, remaining, avg
+    avg = sum((lot[0] * lot[1] for lot in lots), Decimal(0)) / remaining if remaining != 0 else Decimal(0)
+    return realized, remaining, avg, total_fees, total_volume, market, n
 
 
 def fetch_oracle_price(base, market):
@@ -190,48 +274,55 @@ def main():
     # Exactly one price SOURCE (mutually exclusive, required): a network to fetch the live
     # oraclePrice, or --price to supply it directly (a fully offline run). Everything else in the
     # output is computed from the file alone -- only latestPrice/unrealizedPnL need a price.
-    src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--mainnet", dest="network", action="store_const", const="mainnet",
-                     help="fetch the latest price from the mainnet server")
-    src.add_argument("--testnet", dest="network", action="store_const", const="testnet",
-                     help="fetch the latest price from the testnet server")
-    src.add_argument("--staging", dest="network", action="store_const", const="staging",
-                     help="fetch the latest price from the staging server")
+    src = add_network_args(p, verb="fetch the latest price from")
     src.add_argument("--price", type=price_arg, metavar="PRICE",
                      help="use this exact latest price for unrealized PnL (no network fetch)")
     args = p.parse_args()
 
-    if args.file == "-":
-        if sys.stdin.isatty():
-            raise SystemExit("calculate_pnl: no input file given and stdin is a tty (see --help).")
-        fills, markets = read_fills(sys.stdin, args.market)
-    else:
+    want = args.market
+    result = None                                # (realized, remaining, avg, total_fees, total_volume, market)
+
+    if args.file != "-":
+        # FILE: STREAM it BACKWARD -- a newest-first display_fills file read last-line-first is OLDEST-first,
+        # so FIFO runs in O(open position) memory instead of loading + sorting ~GBs for a 5M+ fill file. Only
+        # scan for the market when --market isn't given (cheap forward pass). If the input turns out NOT to be
+        # newest-first, fall back to the buffered sort below (correct for any input).
         try:
-            with open(args.file) as fh:
-                fills, markets = read_fills(fh, args.market)
+            market = want or resolve_market(scan_markets(args.file, want))
+            r = compute_pnl(parsed_fills(reversed_lines(args.file), market), guard_monotonic=True)
+            if r[6] == 0:                        # n == 0 -> nothing matched
+                raise SystemExit("calculate_pnl: no fills parsed from input"
+                                 + (f" for market {market}" if want else "") + ".")
+            realized, remaining, avg, total_fees, total_volume = r[0], r[1], r[2], r[3], r[4]
+            result = (realized, remaining, avg, total_fees, total_volume, market)
+        except NotMonotonic:
+            print("calculate_pnl: WARNING input is not in display_fills (newest-first) order; falling back "
+                  "to a buffered sort (memory grows with the file).", file=sys.stderr)
         except OSError as e:
             raise SystemExit(f"calculate_pnl: cannot read {args.file}: {e}")
 
-    if not fills:
-        raise SystemExit("calculate_pnl: no fills parsed from input"
-                         + (f" for market {args.market}" if args.market else "") + ".")
-    if args.market:
-        market = args.market
-    elif len(markets) == 1:
-        market = next(iter(markets))
-    else:
-        raise SystemExit("calculate_pnl: input mixes multiple markets "
-                         f"({', '.join(sorted(markets))}); pass --market to pick one.")
+    if result is None:
+        # STDIN (not seekable) or the non-monotonic fallback: buffered read + sort (original behaviour).
+        if args.file == "-":
+            if sys.stdin.isatty():
+                raise SystemExit("calculate_pnl: no input file given and stdin is a tty (see --help).")
+            fills, markets = read_fills(sys.stdin, want)
+        else:
+            with open(args.file) as fh:
+                fills, markets = read_fills(fh, want)
+        if not fills:
+            raise SystemExit("calculate_pnl: no fills parsed from input"
+                             + (f" for market {want}" if want else "") + ".")
+        market = want or resolve_market(markets)
+        # Oldest-first for FIFO: reverse (display_fills emits newest-first) then a stable sort by createdAt,
+        # so ties keep the reversed (oldest-first) order and non-sorted input is still fixed.
+        fills.reverse()
+        fills.sort(key=lambda f: f["created"])
+        r = compute_pnl(iter(fills), guard_monotonic=False)
+        realized, remaining, avg, total_fees, total_volume = r[0], r[1], r[2], r[3], r[4]
+        result = (realized, remaining, avg, total_fees, total_volume, market)
 
-    # Oldest-first for FIFO: reverse (display_fills emits newest-first) then a stable sort by
-    # createdAt, so ties keep the reversed (oldest-first) order and non-sorted input is still fixed.
-    fills.reverse()
-    fills.sort(key=lambda f: f["created"])
-
-    realized, remaining, avg = fifo_pnl(fills)
-    total_fees = sum((f["fee"] for f in fills), Decimal(0))
-    total_volume = sum((f["size"] * f["price"] for f in fills), Decimal(0))
-
+    realized, remaining, avg, total_fees, total_volume, market = result
     latest = args.price if args.price is not None else fetch_oracle_price(NETWORKS[args.network], market)
     unrealized = (latest - avg) * remaining          # signed remaining handles long/short
 
@@ -245,11 +336,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except BrokenPipeError:
-        try:
-            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        except Exception:
-            pass
-        sys.exit(0)
+    run_pipe_safe(main)
