@@ -1,5 +1,5 @@
 """
-Place an order on Arcus testnet (v5 typed-payload signing).
+Place an order on Arcus (v5 typed-payload signing).
 
 LIMIT (a --price is given):
   python3 place_order.py --market BTC-USD --quantity 0.1 --price 50000
@@ -35,7 +35,7 @@ import os
 import sys
 import time
 import urllib.parse
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+from decimal import Decimal, ROUND_FLOOR
 
 # Resolve ordersign / arcus_common_private / arcus_creds_<network>.json relative to THIS script
 # (in private/), so it works from any cwd and can't import a stray module.
@@ -45,12 +45,11 @@ sys.path.insert(0, _HERE)
 import ordersign
 from ordersign import Signer
 from arcus_common_private import (
-    add_network_args, call, check_order_response, clamp_to_mark_cap, clock_delta, dec, load_creds, positive_decimal, resolve_market, round_to_increment, select_network, to_quantums, to_ticks, validate_client_id)
+    add_network_args, call, check_order_response, clock_delta, dec, load_creds, place_market_ioc, positive_decimal, resolve_market, round_to_increment, select_network, to_quantums, to_ticks, validate_client_id)
 
-MAX_SLIPPAGE = Decimal("0.03")          # 3% of mid, for market orders
-PRICE_BUFFER = Decimal("0.01")          # normal: pad the bound +/-1% past the worst level
-FORCE_MARK_BOUND = Decimal("0.09")      # --force: bound = mark +/-9% (under the API's 10% cap)
-
+# The MARKET-order path (book-walk + slippage guard + protective bound + sign/POST, and its MAX_SLIPPAGE /
+# PRICE_BUFFER / FORCE_MARK_BOUND constants) now lives in arcus_common_private.place_market_ioc, shared with
+# pivot_trader.py. This module keeps only the LIMIT path + USD sizing + the CLI.
 SIDES = {"BUY": ordersign.SIDE_BUY, "SELL": ordersign.SIDE_SELL}
 TIFS = {"GTT": ordersign.TIF_GTC, "FOK": ordersign.TIF_FOK,
         "IOC": ordersign.TIF_IOC, "ALO": ordersign.TIF_ALO}
@@ -70,23 +69,7 @@ def to_step(qty, step_size):
     return q
 
 
-# ── Order-book walking ────────────────────────────────────────────────────────
-def walk_book(levels, qty):
-    """Walk pre-sorted levels filling up to qty -> (avg, worst, filled, enough)."""
-    remaining, cost, filled, worst = qty, Decimal(0), Decimal(0), None
-    for price_s, size_s in levels:
-        if remaining <= 0:
-            break
-        price, size = Decimal(price_s), Decimal(size_s)
-        take = size if size < remaining else remaining
-        cost += price * take
-        filled += take
-        remaining -= take
-        worst = price_s
-    avg = (cost / filled) if filled > 0 else None
-    return avg, worst, filled, remaining <= 0
-
-
+# ── Order-book walking (USD sizing only; the base-size walk lives in arcus_common_private.walk_book) ──────
 def walk_book_usd(levels, budget):
     """Walk pre-sorted levels by USD budget -> (filled_qty, avg, worst, enough)."""
     spent, filled, worst = Decimal(0), Decimal(0), None
@@ -109,7 +92,7 @@ def walk_book_usd(levels, budget):
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 def parse_args():
-    parser = argparse.ArgumentParser(description="Place an order on Arcus testnet.")
+    parser = argparse.ArgumentParser(description="Place an order on Arcus.")
     parser.add_argument("--market", default="BTC-USD", help="market display name, e.g. BTC-USD")
     parser.add_argument("--side", default="BUY", choices=list(SIDES))
     qty_group = parser.add_mutually_exclusive_group(required=True)
@@ -135,11 +118,10 @@ def main():
     # Server rule: MARKET orders must be IOC (no resting/FOK market orders).
     if is_market and tif != "IOC":
         raise SystemExit(f"--tif {tif}: a MARKET order (no --price) must be IOC.")
-    # Server rule: a reduce-only order must be IOC or FOK -- a resting GTT/ALO reduce-only is
-    # rejected at validation ("must be IOC or FOK when reduce_only is true", verified live 2026-06-28).
-    if args.reduce_only and tif not in ("IOC", "FOK"):
-        raise SystemExit(f"--tif {tif}: a reduce-only order must be IOC or FOK "
-                         f"(the venue rejects a resting reduce-only GTT/ALO).")
+    # (Historical note: reduce-only orders once had to be IOC or FOK. testnet-v1.1.98, 2026-07-08,
+    # dropped that rule -- a resting reduce-only order is now valid with any TIF. Confirmed live on
+    # testnet 2026-08-20: a reduce-only GTT rested (status OPEN) instead of the old validation reject.
+    # So no reduce-only/TIF guard here; only the MARKET-must-be-IOC rule above still applies.)
 
     # --- Validate all inputs locally, before any signing/sending --------------
     if args.price is not None:
@@ -179,32 +161,36 @@ def main():
         raise SystemExit(f"place_order: market {args.market!r} has incomplete/malformed metadata "
                          f"(marketId / tickSize>0 / stepSize>0 / marketDisplayName).")
     usd_mode = args.quantityusd is not None
+    # Optional order-size bounds (minOrderSize/maxOrderSize v1.3.8, minOrderNotional): validated against the
+    # FINAL qty below for a clear client-side error instead of a venue OrderSizeTooLarge / min-size / min-notional
+    # reject. Each bound is skipped when absent/null/non-positive.
+    min_order_size = dec(mkt.get("minOrderSize"))
+    max_order_size = dec(mkt.get("maxOrderSize"))
+    min_order_notional = dec(mkt.get("minOrderNotional"))
 
     # --- Determine the order's quantity and price -----------------------------
     if is_market:
-        ob = call("GET", f"/v1/l2OrderBook/{urllib.parse.quote(args.market)}")
-        if not isinstance(ob, dict):
-            raise SystemExit(f"{args.market}: unexpected /v1/l2OrderBook response (not a JSON object).")
-        bids, asks = ob.get("bids", []), ob.get("asks", [])
-        if not bids or not asks:
-            raise SystemExit(f"{args.market}: order book has no two-sided liquidity.")
-        try:                                    # every level must be a [finite-positive price, finite-positive size]
-            for lv in (*bids, *asks):           # PAIR. Bare Decimal() ACCEPTS "NaN"/"Infinity"/negatives -- those would
-                if not isinstance(lv, (list, tuple)) or len(lv) != 2:   # flow into mid/slippage and FAIL the slippage
-                    raise ValueError("level is not a 2-element list")    # guard OPEN (NaN>MAX and negative>MAX are both
-                p, s = Decimal(lv[0]), Decimal(lv[1])                    # False). is_finite() short-circuits the > 0
-                if not (p.is_finite() and p > 0 and s.is_finite() and s > 0):   # so NaN never reaches the comparison.
-                    raise ValueError("level price/size must be finite and positive")
-        except (ArithmeticError, TypeError, ValueError):
-            raise SystemExit(f"{args.market}: malformed order book from /v1/l2OrderBook (level not a finite-positive [price, size] pair).")
-        # Sort defensively (don't trust the server's ordering): asks ascending,
-        # bids descending -> best bid/ask are index 0; walk in consume order.
-        asks = sorted(asks, key=lambda lv: Decimal(lv[0]))
-        bids = sorted(bids, key=lambda lv: Decimal(lv[0]), reverse=True)
-        mid = (Decimal(bids[0][0]) + Decimal(asks[0][0])) / 2
-        levels = asks if args.side == "BUY" else bids
-
+        # Size the order in base units, then hand off to the shared MARKET-IOC path: the book-walk + slippage
+        # guard + protective bound + size/notional check + sign/POST live in place_market_ioc (arcus_common_private),
+        # the SAME code pivot_trader.py uses. Only USD sizing (which walks the book by budget) stays here.
         if usd_mode:
+            ob = call("GET", f"/v1/l2OrderBook/{urllib.parse.quote(args.market)}")
+            if not isinstance(ob, dict):
+                raise SystemExit(f"{args.market}: unexpected /v1/l2OrderBook response (not a JSON object).")
+            bids, asks = ob.get("bids", []), ob.get("asks", [])
+            if not bids or not asks:
+                raise SystemExit(f"{args.market}: order book has no two-sided liquidity.")
+            try:
+                for lv in (*bids, *asks):
+                    if not isinstance(lv, (list, tuple)) or len(lv) != 2:
+                        raise ValueError("level is not a 2-element list")
+                    p, s = Decimal(lv[0]), Decimal(lv[1])
+                    if not (p.is_finite() and p > 0 and s.is_finite() and s > 0):
+                        raise ValueError("level price/size must be finite and positive")
+            except (ArithmeticError, TypeError, ValueError):
+                raise SystemExit(f"{args.market}: malformed order book from /v1/l2OrderBook (level not a finite-positive [price, size] pair).")
+            levels = sorted(asks, key=lambda lv: Decimal(lv[0])) if args.side == "BUY" \
+                else sorted(bids, key=lambda lv: Decimal(lv[0]), reverse=True)
             budget = Decimal(args.quantityusd)
             raw_qty, _, _, budget_ok = walk_book_usd(levels, budget)
             qty = to_step(raw_qty, step_size)
@@ -214,68 +200,17 @@ def main():
         else:
             qty = Decimal(args.quantity)
 
-        avg_fill, worst_price, filled, enough = walk_book(levels, qty)
-        if avg_fill is None:
-            raise SystemExit(f"{args.market}: empty book on the {args.side} side.")
-        slippage = abs(avg_fill - mid) / mid
-        print(f"MARKET {args.side} {qty:f} {args.market}: mid={mid:.6f}  "
-              f"est avg fill={avg_fill:.6f}  slippage={slippage * 100:.2f}%  worst level={worst_price}")
-        if not enough:
-            print(f"  WARNING: book only covers {filled} of {qty}; an IOC order will partially fill.")
-        if not slippage.is_finite():            # defense-in-depth: a non-finite slippage means the pricing is broken
-            raise SystemExit(                   # (malformed book). NEVER place -- not even with --force, since NaN>MAX
-                f"{args.market}: computed slippage is non-finite "   # is False and would silently fail the guard OPEN.
-                f"(mid={mid}, avg_fill={avg_fill}) -- book is malformed, not placing.")
-        if slippage > MAX_SLIPPAGE and not args.force:
-            raise SystemExit(
-                f"  Slippage {slippage * 100:.2f}% exceeds {MAX_SLIPPAGE * 100:.0f}% limit "
-                f"-- not placing. Re-run with --force to override.")
-        if slippage > MAX_SLIPPAGE:
-            print(f"  --force: placing despite {slippage * 100:.2f}% slippage.")
-
-        if args.force:
-            mark = dec(mkt.get("markPrice"))
-            if mark is None or mark <= 0:
-                mark = mid          # fall back to mid if markPrice missing/zero
-                print("  note: markPrice unavailable/zero; using mid for the --force bound.")
-            target = mark * (1 + FORCE_MARK_BOUND) if args.side == "BUY" else mark * (1 - FORCE_MARK_BOUND)
-            label = f"mark {mark} +/-{FORCE_MARK_BOUND * 100:.0f}% (--force)"
-        else:
-            worst = Decimal(worst_price)
-            target = worst * (1 + PRICE_BUFFER) if args.side == "BUY" else worst * (1 - PRICE_BUFFER)
-            label = f"worst level {worst_price} +/-{PRICE_BUFFER * 100:.0f}%"
-        # Round the protective bound AWAY from mid so tick-rounding never makes it TIGHTER than the
-        # intended target: BUY (max acceptable price) rounds UP, SELL (min acceptable price) rounds
-        # DOWN. (Rounding toward mid could trim the worst consumable level and cause avoidable
-        # partial/no fills. The 1%/9% buffers are far wider than one tick, so this can't breach the
-        # API's 10%-of-mark cap.)
-        bound = round_to_increment(target, tick_size, ROUND_CEILING if args.side == "BUY" else ROUND_FLOOR)
-        if args.force:
-            # The --force bound is mark-based; keep it within the venue's 10%-of-mark cap so a coarse tick
-            # rounding the 9% bound away can't push it past 10% -> order rejected.
-            bound = clamp_to_mark_cap(bound, mark, tick_size, args.side == "BUY")
-        else:
-            # The non-force bound is BOOK-relative (worst level +/-1%), but the venue STILL checks it against the
-            # 10%-of-mark cap. A book dislocated >10% from markPrice would be REJECTED on submit -> refuse up front
-            # and point to --force (a mark-based bound) rather than sending a doomed order (docs' "--force" case).
-            # markPrice unavailable -> can't check -> let the venue decide (unchanged).
-            mk = dec(mkt.get("markPrice"))
-            if mk is not None and mk > 0 and abs(bound - mk) > mk * Decimal("0.10"):
-                raise SystemExit(
-                    f"  {args.market}: order-book bound {bound} is >10% off markPrice {mk} (the venue's market-order "
-                    f"cap); the book is dislocated from mark. Re-run with --force for a mark-based bound.")
-        # A SELL floor can tick-round DOWN to 0 when the price is within ~1 tick of tickSize (target < tick),
-        # leaving a MARKET SELL with NO protective floor (0 = accept any fill). Also backstops a 0 mark/mid.
-        # There is no safe protective MARKET bound here -- refuse; the operator can place a LIMIT order.
-        if bound <= 0:
-            raise SystemExit(
-                f"  protective bound rounded to {bound} (<= 0): {args.market} price is within ~1 tick of "
-                f"tickSize {tick_size}, so a MARKET {args.side} would carry no protective bound. "
-                f"Refusing -- place a LIMIT order instead.")
-        print(f"  bound={bound:f}  ({label})")
-
-        order_type = "MARKET"
-        price = f"{bound:f}"
+        result = place_market_ioc(signer, address, account_index, mkt, args.side, qty,
+                                  force=args.force, client_id=args.client_id)
+        if not result["placed"]:                 # slippage guard blocked it (est > 3% and not --force)
+            raise SystemExit(f"  {result['reason']} -- not placing. Re-run with --force to override.")
+        print(f"MARKET {args.side} {qty:f} {args.market}: mid={result['mid']:.6f}  "
+              f"est avg fill={result['avg_fill']:.6f}  slippage={result['slippage'] * 100:.2f}%  "
+              f"worst level={result['worst']}  bound={result['bound']:f}" + ("  (--force)" if args.force else ""))
+        if not result["enough"]:
+            print(f"  WARNING: book only partly covered {qty:f}; the IOC partially filled.")
+        print("Order response:", json.dumps(result["order"], indent=2))   # helper already check_order_response'd it
+        return
     else:
         order_type = "LIMIT"
         price = str(args.price)
@@ -286,6 +221,20 @@ def main():
             qty = Decimal(args.quantity)
         print(f"{args.market} (marketId {market_id})  LIMIT {args.side} {qty:f} @ {price}"
               f"  tick={tick_size} step={step_size}")
+
+    # Pre-validate the final size/notional against the market's bounds -> a clear error BEFORE signing (else the
+    # venue rejects with OrderSizeTooLarge / a min-size / min-notional reason). Each bound is skipped when absent.
+    if min_order_size is not None and min_order_size > 0 and qty < min_order_size:
+        raise SystemExit(f"{args.market}: size {qty:f} is below the market minimum order size {min_order_size:f} "
+                         f"(minOrderSize) -- increase --quantity/--quantityusd.")
+    if max_order_size is not None and max_order_size > 0 and qty > max_order_size:
+        raise SystemExit(f"{args.market}: size {qty:f} exceeds the market maximum order size {max_order_size:f} "
+                         f"(maxOrderSize) -- reduce --quantity/--quantityusd.")
+    _price_dec = dec(str(price))
+    if (min_order_notional is not None and min_order_notional > 0 and _price_dec is not None
+            and qty * _price_dec < min_order_notional):
+        raise SystemExit(f"{args.market}: order notional {qty * _price_dec:f} is below the market minimum "
+                         f"{min_order_notional:f} (minOrderNotional) -- increase the size.")
 
     qty_str = f"{qty:f}"
     # Exact-multiple conversion (rejects mis-aligned price/qty with a clear error
