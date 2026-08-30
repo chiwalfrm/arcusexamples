@@ -85,14 +85,17 @@ printf '\n'
 # entered above. Catches the common mis-paste before it lands in the creds file.
 echo
 echo "Verifying API private key..."
-API_PUB="$api_public_key" API_PRIV="$api_private_key" python3 - <<'PY'
+# Pass the PRIVATE KEY on STDIN (a pipe), NOT an env var: an env var is readable via /proc/<pid>/environ for
+# the subprocess's whole lifetime and is inherited by any child it spawns; a pipe is neither, and nothing
+# touches disk. The public key is not secret, so it stays in the env. (`python3 -c` so stdin is free for the key.)
+printf '%s' "$api_private_key" | API_PUB="$api_public_key" python3 -c '
 import os, sys
 try:
     from cryptography.hazmat.primitives.asymmetric import ed25519
 except ImportError:
-    sys.exit("  FAIL: python 'cryptography' package not installed; cannot verify.")
+    sys.exit("  FAIL: python cryptography package not installed; cannot verify.")
 
-priv_hex = (os.environ.get("API_PRIV") or "").strip()
+priv_hex = sys.stdin.read().strip()
 pub_hex  = (os.environ.get("API_PUB")  or "").strip()
 
 try:
@@ -118,7 +121,7 @@ if pub_hex.lower() != derived.lower():
              f"         derived public: {derived}")
 
 print("  OK: valid Ed25519 key, signs correctly, and matches the public key.")
-PY
+'
 if [ $? -ne 0 ]; then
   echo "Key verification failed -- nothing written."
   exit 1
@@ -160,16 +163,16 @@ fi
 # Assemble once so what we show is exactly what we'd write. Build the JSON with
 # json.dumps (not shell interpolation) so no character in any field can corrupt the
 # file -- a quote/backslash/newline is escaped, not injected.
-creds=$(ETH="$eth_address" PUB="$api_public_key" PRIV="$api_private_key" python3 - <<'PY'
-import os, json
+# Private key on STDIN again (never in env / never on disk); eth_address + public key are not secret -> env is fine.
+creds=$(printf '%s' "$api_private_key" | ETH="$eth_address" PUB="$api_public_key" python3 -c '
+import os, json, sys
 print(json.dumps({
     "eth_address": os.environ["ETH"],
     "api_public_key": os.environ["PUB"],
-    "api_private_key": os.environ["PRIV"],
+    "api_private_key": sys.stdin.read().strip(),
     "account_index": 0,
 }, indent=2))
-PY
-)
+')
 if [ $? -ne 0 ] || [ -z "$creds" ]; then
   echo "Failed to assemble creds JSON -- nothing written."
   exit 1
