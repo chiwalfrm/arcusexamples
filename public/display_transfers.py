@@ -33,22 +33,25 @@ in these fields). Output is newest-first.
 
 import argparse
 import csv
-import json
-import os
-import re
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 from decimal import Decimal
 from functools import partial
-from arcus_common_public import NETWORKS, UNLIMITED, dec, epoch_us_arg, get_json_dict, limit_arg, page_pace_delay, when   # shared public helpers (formerly local copies)
+from arcus_common_public import TABLE_MAX_ROWS, add_network_args, require_eth_address, run_pipe_safe, NETWORKS, UNLIMITED, dec, dedup_vs_previous_page, id_or_json_key, epoch_us_arg, get_json_dict, limit_arg, page_pace_delay, when   # shared public helpers (formerly local copies)
 
-_get_json = partial(get_json_dict, prog="display_transfers")   # get_json + require_dict, this tool's prog
+_gjd = partial(get_json_dict, prog="display_transfers")   # get_json + require_dict, this tool's prog
+INFINITE_RETRY = False    # set by --infinite-retry: retry TRANSIENT fetch failures forever (never give up on a huge export)
+
+
+def _get_json(url, what, **kw):
+    """Wrap _gjd to inject this tool's --infinite-retry flag (read at call time, so main can flip it after arg
+    parsing). Every _get_json(...) in this tool then honours --infinite-retry."""
+    return _gjd(url, what, infinite=INFINITE_RETRY, **kw)
 
 
 BASE = None
-ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 PAGE_SIZE = 1000
 INFLOW_TYPES = {"DEPOSIT", "REFERRAL_CLAIM"}
 CONDENSED_KEYS = ["id", "createdAt", "type", "status", "accountIndex", "amount"]  # amount = SIGNED
@@ -79,12 +82,17 @@ def fetch_transfers(address, limit, from_us=None, to_us=None):
     return [r for r in rows if isinstance(r, dict)]   # drop any non-dict element so downstream .get() can't crash
 
 
-def fetch_transfers_all(address, from_us=None, to_us=None):
-    """ALL transfer updates for the address, paged backward via the `to` cursor. from/to/createdAt are all
-    epoch MICROseconds (same unit), so the cursor is the oldest createdAt directly -- NO conversion. `to` is
-    INCLUSIVE (closes over the microsecond it names), so the boundary row re-reads next page; dedup by id
-    drops it. `from` (server-side) is a lower bound; sent as 0 unless given, so no default window truncates."""
-    seen, out, cursor = set(), [], to_us
+def iter_transfers_pages(address, from_us=None, to_us=None):
+    """ALL transfer updates for the address, as a GENERATOR: yield each page's FRESH (deduped) rows LIST,
+    newest-first, paging BACKWARD via the `to` cursor -- so a caller can STREAM one page at a time. from/to/
+    createdAt are all epoch MICROseconds (same unit), so the cursor is the oldest createdAt directly -- NO
+    conversion. `to` is INCLUSIVE, so the boundary row re-reads next page; dedup by id drops it -- against the
+    PREVIOUS page ONLY (the cursor strictly decreases, so page N+1 overlaps only page N -> bounded memory, not
+    O(total)). `from` (server-side) is a lower bound; sent as 0 unless given, so no default window truncates.
+    NB the TOOL (main) still BUFFERS: `signed_amount` needs `own_wire_ids` learned from the WHOLE set (to sign a
+    SELF_ACCOUNT_TRANSFER), so no row's amount can be emitted until every row is scanned. fetch_transfers_all()
+    flattens this."""
+    prev_keys, cursor = set(), to_us
     eff_from = from_us if from_us is not None else 0
     first = True
     while True:
@@ -104,20 +112,12 @@ def fetch_transfers_all(address, from_us=None, to_us=None):
             raise SystemExit("display_transfers: unexpected response ('accountTransferUpdates' is not a list).")
         if not rows:
             break
-        fresh = []
-        for r in rows:
-            if not isinstance(r, dict):
-                continue
-            rid = r.get("id")
-            # Dedup key: the id when present, else the full-row content. A row with NO id would otherwise
-            # NEVER dedup, so the pagination-boundary row (re-read because `to` is inclusive) would be counted
-            # twice and inflate the totals. The boundary re-read is the IDENTICAL row, so its sorted JSON matches.
-            key = rid if rid is not None else json.dumps(r, sort_keys=True, separators=(",", ":"))
-            if key in seen:
-                continue
-            seen.add(key)
-            fresh.append(r)
-        out.extend(fresh)
+        # Dedup by id (id-less row -> full-row JSON) against the PREVIOUS page only: the inclusive `to` cursor
+        # re-reads just the boundary microsecond, which strictly decreases, so page N+1 overlaps ONLY page N --
+        # bounded to ~one page, not O(total). (See dedup_vs_previous_page.)
+        fresh, prev_keys = dedup_vs_previous_page(rows, prev_keys, lambda r: id_or_json_key(r, "id"))
+        if fresh:
+            yield fresh
         if len(rows) < PAGE_SIZE:      # fewer than a full page -> reached the oldest / `from`
             break
         if not fresh:                   # no new ids -> stop, never loop
@@ -129,7 +129,12 @@ def fetch_transfers_all(address, from_us=None, to_us=None):
         if cursor is not None and nc >= cursor:    # cursor didn't decrease -> avoid an infinite loop
             break
         cursor = nc
-    return out
+
+
+def fetch_transfers_all(address, from_us=None, to_us=None):
+    """ALL transfer updates for the address, COLLECTED into one list -- the tool needs the full set (own_wire_ids
+    for signed amounts, plus the table's widths/sort/totals). Streaming callers use iter_transfers_pages()."""
+    return [r for page in iter_transfers_pages(address, from_us, to_us) for r in page]
 
 
 def is_applied(row):
@@ -183,7 +188,7 @@ COLS = [
 
 
 def main():
-    global BASE
+    global BASE, INFINITE_RETRY
     parser = argparse.ArgumentParser(description="Display account deposits/withdrawals/transfers.")
     parser.add_argument("address", help="Ethereum address of the account to display")
     parser.add_argument("--all", action="store_true",
@@ -204,18 +209,15 @@ def main():
                              "(id,createdAt,type,status,accountIndex,signedAmount), no header/padding/totals")
     parser.add_argument("--header", action="store_true",
                         help="with --condensed, emit a CSV header row first (error without --condensed)")
-    net = parser.add_mutually_exclusive_group(required=True)
-    net.add_argument("--testnet", dest="network", action="store_const", const="testnet",
-                     help="query the testnet server")
-    net.add_argument("--staging", dest="network", action="store_const", const="staging",
-                     help="query the staging server")
-    net.add_argument("--mainnet", dest="network", action="store_const", const="mainnet",
-                     help="query the mainnet server")
+    parser.add_argument("--infinite-retry", action="store_true",
+                        help="never give up on TRANSIENT fetch failures (network timeout / 429 / 5xx): retry "
+                             "forever with capped backoff instead of failing after 5 attempts -- for very large "
+                             "multi-hour exports. A terminal 4xx (403/404) still fails fast.")
+    add_network_args(parser)
     args = parser.parse_args()
+    INFINITE_RETRY = args.infinite_retry
     BASE = NETWORKS[args.network]
-    if not ADDR_RE.match(args.address):
-        raise SystemExit(f"display_transfers: invalid Ethereum address {args.address!r} "
-                         f"(expected 0x + 40 hex chars).")
+    require_eth_address(args.address, "display_transfers")
     if args.from_us is not None and args.to_us is not None and args.from_us > args.to_us:
         raise SystemExit("display_transfers: --from must be <= --to.")
     if args.header and not args.condensed:
@@ -227,6 +229,11 @@ def main():
     else:
         raw = fetch_transfers(args.address, args.limit, args.from_us, args.to_us)
         truncated = len(raw) >= args.limit         # a full page back -> older rows may exist -> NET is partial
+    if len(raw) > TABLE_MAX_ROWS:
+        raise SystemExit(
+            f"display_transfers: too many transfers to buffer (> {TABLE_MAX_ROWS:,}). This tool holds the full set "
+            f"in memory in BOTH modes (own_wire_ids for signed amounts, plus the table's sort/totals). Narrow with "
+            f"--from/--to or a smaller --limit.")
     hidden = sum(1 for r in raw if r.get("type") == "INTERNAL_TRANSFER")
     kept = raw if args.all else [r for r in raw if r.get("type") != "INTERNAL_TRANSFER"]
     kept.sort(key=created_us, reverse=True)      # newest-first
@@ -289,11 +296,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except BrokenPipeError:
-        try:
-            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        except Exception:
-            pass
-        sys.exit(0)
+    run_pipe_safe(main)
