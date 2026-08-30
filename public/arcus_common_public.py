@@ -17,12 +17,14 @@ stay runnable on any Python.
 """
 import argparse
 import asyncio
+import csv
 import http.client
 import json
 import logging
 import math
 import os
 import random
+import re
 import sys
 import time
 import urllib.error
@@ -47,9 +49,74 @@ NETWORKS = {
 }
 
 
+class SubscriptionError(Exception):
+    """The server rejected a subscription / request -- a channel-less frame carrying an `error` object or an
+    HTTP-like `status` >= 400 (see the WS 'Errors' docs: `{status, error:{type,message,field}}`). The WS loops
+    treat it as a RECONNECTABLE condition (resubscribe on a fresh socket with backoff), NOT a fatal exit: a
+    transient server-side subscription hiccup must not silently kill a long-running logger."""
+
+
 def ws_url(network):
     """The WebSocket URL for `network`, derived from the REST base (https -> wss, + /v1/ws)."""
     return NETWORKS[network].replace("https://", "wss://", 1) + "/v1/ws"
+
+
+# ── Liveness pid-files ──────────────────────────────────────────────────────────
+# A long-running program drops a marker file  <log_dir>/pids/<name>-<PID>  at startup so a monitor can tell whether
+# it is still running: list the pids dir, take each filename's trailing numeric segment as a PID, and check it is
+# alive. A file whose PID is NOT alive means that instance DIED (crashed or was killed) -- exactly the
+# "it died and nobody noticed" case. We deliberately DON'T delete the file on exit: a dead-PID marker IS the
+# signal. Instead, at startup we clear any STALE same-name marker whose PID is already dead, so a
+# crash-then-restart leaves just the one live marker rather than piling up. (Log files have extensions, so the
+# "trailing segment is all digits" test never mistakes a rotating .log/.stdout for a marker.)
+def pid_alive(pid):
+    """True if a process with `pid` currently exists (best-effort, POSIX)."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True                              # exists, owned by another user
+    except OSError:
+        return False
+    return True
+
+
+def write_pidfile(log_dir, name):
+    """Drop a liveness marker  <log_dir>/pids/<name>-<PID>  and return its path (None on failure).
+
+    `name` must identify the program AND its instance (e.g. 'wsorderbook-BTC-USD') so two instances don't
+    collide. Best-effort: any error is warned to stderr and swallowed -- a monitoring aid must never keep the
+    program from starting. See the note above for the (no-delete-on-exit) liveness model.
+    """
+    try:
+        pid = os.getpid()
+        pid_dir = os.path.join(log_dir, "pids")   # keep markers out of the cluttered log dir
+        os.makedirs(pid_dir, exist_ok=True)
+        prefix = name + "-"
+        keep = "%s%d" % (prefix, pid)
+        for fn in os.listdir(pid_dir):           # sweep stale same-name markers left by prior DEAD instances
+            if (fn.startswith(prefix) and fn != keep
+                    and fn[len(prefix):].isdigit() and not pid_alive(fn[len(prefix):])):
+                try:
+                    os.remove(os.path.join(pid_dir, fn))
+                except OSError:
+                    pass
+        path = os.path.join(pid_dir, keep)
+        with open(path, "w") as fh:
+            fh.write("pid=%d\nname=%s\nstarted=%s\nargv=%s\n" % (
+                pid, name, datetime.now(timezone.utc).isoformat(timespec="seconds"), " ".join(sys.argv)))
+        return path
+    except Exception as e:                        # never let a monitoring aid break startup
+        print("[pidfile] WARNING could not write pid-file for %r in %r: %s" % (name, log_dir, e),
+              file=sys.stderr)
+        return None
 
 
 def plan_reconnect_sleep(conn_start, now, delay, base, max_delay, stable_after,
@@ -89,7 +156,96 @@ def plan_reconnect_sleep(conn_start, now, delay, base, max_delay, stable_after,
 # ── HTTP JSON reader ─────────────────────────────────────────────────────────
 HTTP_TIMEOUT = 10.0     # default per-request read timeout (s)
 RETRY_AFTER_CAP = 30.0  # s; cap an honored Retry-After so a hostile/misconfigured header can't park a caller
+TABLE_MAX_ROWS = 200_000  # a (non-condensed) display table BUFFERS every row (column widths / sort / totals) so it
+                          # can't stream; the tool aborts past this rather than OOM/swap-thrash a host. --condensed
+                          # streams at ~constant memory and has NO cap. (the per-tool abort message says which.)
+SUB_ERR_LIMIT = 10        # WS: consecutive subscription rejections (with no stable connection between) before a
+                          # ws_loop gives up and exits -- so a genuinely-bad subscription dies visibly (dead PID)
 IP_WEIGHT_REFILL_PER_S = 25.0   # per-IP weight-bucket refill (rate-limits: 1500 weight/min); see page_pace_delay
+
+
+def dedup_vs_previous_page(rows, prev_keys, key_fn):
+    """Bounded-memory pagination dedup shared by every iter_*_pages streamer. Returns
+    (fresh_rows, this_page_keys): the rows whose key is in NEITHER `prev_keys` (the immediately-preceding page)
+    NOR already-seen this page, plus the set of keys seen this page -- which the caller carries forward as the
+    next `prev_keys`. `key_fn(row)` returns a hashable dedup key, or None to DROP the row (a non-dict / malformed
+    element). Only the PREVIOUS page's keys are needed (not a global set) because a paginator's cursor strictly
+    decreases -- or its offset pages barely overlap -- so any row can reappear ONLY in the page right after the
+    one that first emitted it. A global set would be O(total rows) and swap-thrash a huge history (the bug this
+    fixed). See each iter_*_pages for its per-endpoint cursor rationale."""
+    fresh, cur_keys = [], set()
+    for r in rows:
+        k = key_fn(r)
+        if k is None or k in prev_keys or k in cur_keys:
+            continue
+        cur_keys.add(k)
+        fresh.append(r)
+    return fresh, cur_keys
+
+
+def id_or_json_key(row, id_field):
+    """A common dedup key for use with dedup_vs_previous_page: row[`id_field`] when present (not None), else the
+    row's full sorted-JSON content -- so an id-less row still dedups the inclusive-cursor boundary re-read
+    instead of being double-counted (which would inflate totals). Returns None for a non-dict element."""
+    if not isinstance(row, dict):
+        return None
+    v = row.get(id_field)
+    return v if v is not None else json.dumps(row, sort_keys=True, separators=(",", ":"))
+
+
+def stream_condensed_pages(pages, keys, *, header=False, keep=None):
+    """Stream paged rows out as CSV to stdout, flushing once per page. Shared by the streaming --condensed
+    firehoses (display_fills / display_funding[_mainnet] / display_orders' unlimited branch), which all had
+    the same body. `pages` is any iterable of row-lists (a live iter_*_pages generator, or a single-element
+    list wrapping one bounded fetch); `keys` is the CONDENSED_KEYS column order (a missing key renders as '').
+    `keep(row) -> bool` filters rows (None keeps all -- e.g. a marketId or status predicate). Contract: NO
+    global re-sort here (the page order IS the output order); the per-page flush makes output visible as it
+    pages so a huge account starts printing immediately and `| head` can stop it early."""
+    writer = csv.writer(sys.stdout, lineterminator="\n")
+    if header:
+        writer.writerow(keys)
+    for page in pages:
+        for row in page:
+            if keep is None or keep(row):
+                writer.writerow([row.get(k, "") for k in keys])
+        sys.stdout.flush()
+
+
+def run_pipe_safe(main):
+    """Run a CLI tool's `main()`, swallowing a BrokenPipeError from a downstream reader that closed early
+    (e.g. `... | head`): point stdout at devnull so the interpreter's shutdown flush can't re-raise it, then
+    exit 0. Every tool's `if __name__ == "__main__":` calls this instead of copy-pasting the idiom."""
+    try:
+        main()
+    except BrokenPipeError:
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except Exception:
+            pass
+        sys.exit(0)
+
+
+def add_network_args(parser, verb="query"):
+    """Register the REQUIRED, mutually-exclusive --testnet/--staging/--mainnet selector (sets args.network).
+    REQUIRED by design (no default): mainnet is live, so an omitted flag must never silently pick a network.
+    `verb` tailors the help to what the tool uses the network for (default 'query'; e.g. 'fetch the latest
+    price from' for calculate_pnl, 'resolve the market against' for showorderbook). Public twin of
+    arcus_common_private.add_network_args (whose help additionally names the creds file)."""
+    g = parser.add_mutually_exclusive_group(required=True)
+    for net in ("testnet", "staging", "mainnet"):
+        g.add_argument(f"--{net}", dest="network", action="store_const", const=net,
+                       help=f"{verb} the {net} server")
+    return g   # the group, so a caller can add MORE mutually-exclusive options to it (e.g. calculate_pnl's --price)
+
+
+_ETH_ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+
+
+def require_eth_address(address, prog):
+    """Validate an Ethereum address (0x + 40 hex) or exit cleanly. Shared by the display tools (replaces the
+    per-tool `ADDR_RE = re.compile(...)` + raise that was copy-pasted into each)."""
+    if not _ETH_ADDR_RE.match(address):
+        raise SystemExit(f"{prog}: invalid Ethereum address {address!r} (expected 0x + 40 hex chars).")
 
 
 def page_pace_delay(weight=70.0, jitter=0.3):
@@ -102,7 +258,7 @@ def page_pace_delay(weight=70.0, jitter=0.3):
     return (weight / IP_WEIGHT_REFILL_PER_S) * (1 + random.uniform(0, jitter))
 
 
-def get_json(url, *, what="request", prog="arcus", retries=5, none_on_404=False,
+def get_json(url, *, what="request", prog="arcus", retries=5, infinite=False, none_on_404=False,
              timeout=HTTP_TIMEOUT, delay=0.0, on_retry=None):
     """GET `url` -> parsed JSON, retrying TRANSIENT failures with capped exponential backoff. The
     canonical Arcus-API reader (adopts the dydx get_json engineering, arcus-tuned).
@@ -124,8 +280,9 @@ def get_json(url, *, what="request", prog="arcus", retries=5, none_on_404=False,
     if delay:
         time.sleep(delay)
     last = None
-    for attempt in range(retries):
-        retry_after = None
+    attempt = 0
+    while infinite or attempt < retries:                      # `infinite` (--infinite-retry): retry TRANSIENT
+        retry_after = None                                    # failures forever; TERMINAL 4xx still fail fast below
         try:
             with urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=timeout) as r:
                 return json.loads(r.read() or b"{}")
@@ -154,8 +311,8 @@ def get_json(url, *, what="request", prog="arcus", retries=5, none_on_404=False,
             last = f"HTTP protocol error: {type(e).__name__}: {e}"
         except json.JSONDecodeError as e:
             last = f"invalid JSON from the Arcus API: {e}"
-        if attempt < retries - 1:
-            backoff = min(2 ** attempt, 8)                    # 1, 2, 4, 8, 8, ...
+        if infinite or attempt < retries - 1:
+            backoff = min(2 ** min(attempt, 3), 8)            # 1, 2, 4, 8, 8, ...  (exponent capped so infinite can't overflow)
             if retry_after is not None:
                 backoff = max(backoff, min(retry_after, RETRY_AFTER_CAP))
             # Full-jitter ON TOP (never below `backoff`, so an honored Retry-After floor is preserved) so
@@ -163,7 +320,11 @@ def get_json(url, *, what="request", prog="arcus", retries=5, none_on_404=False,
             backoff *= 1 + random.uniform(0, 0.25)
             if on_retry is not None:
                 on_retry()
+            if infinite and (attempt < 3 or attempt % 10 == 0):   # show it's still trying (not frozen) on a long sweep
+                print(f"{prog}: {what}: transient failure (attempt {attempt + 1}): {last} -- retrying (--infinite-retry)",
+                      file=sys.stderr)
             time.sleep(backoff)
+        attempt += 1
     raise SystemExit(f"{prog}: {what}: failed after {retries} attempts ({last}).")
 
 
@@ -219,11 +380,10 @@ def write_markets_cache(path, data):
             pass
 
 
-def resolve_market_id(base, market, prog):
-    """Resolve `market` (display name case-insensitive OR numeric marketId) to a canonical marketId
-    STRING via a LIVE GET /v1/markets. SystemExit(f"{prog}: ...") on a bad response or an unknown
-    market -- a typo must never silently return an empty result. Used by the display tools' --market
-    filter. (The orderbook tools resolve cache-first + inline -- see read_markets_cache callers.)"""
+def _resolve_market_entry(base, market, prog):
+    """Match `market` (display name case-insensitive OR numeric marketId) to its /v1/markets dict via a
+    LIVE GET /v1/markets. SystemExit(f"{prog}: ...") on a bad response or an unknown market -- a typo must
+    never silently return an empty result. Shared by resolve_market_id / resolve_market_name."""
     markets = get_json_dict(f"{base}/v1/markets", "markets", prog).get("markets")
     if not isinstance(markets, list):
         raise SystemExit(f"{prog}: unexpected /v1/markets response (no 'markets' list).")
@@ -232,8 +392,22 @@ def resolve_market_id(base, market, prog):
             continue
         if (str(market).upper() == str(m.get("marketDisplayName", "")).upper()
                 or str(market) == str(m.get("marketId"))):
-            return str(m.get("marketId"))
+            return m
     raise SystemExit(f"{prog}: unknown market {market!r} (not found in /v1/markets).")
+
+
+def resolve_market_id(base, market, prog):
+    """Resolve `market` (display name case-insensitive OR numeric marketId) to a canonical marketId
+    STRING via a LIVE GET /v1/markets. Used by the display tools' --market filter. (The orderbook tools
+    resolve cache-first + inline -- see read_markets_cache callers.)"""
+    return str(_resolve_market_entry(base, market, prog).get("marketId"))
+
+
+def resolve_market_name(base, market, prog):
+    """Resolve `market` (display name case-insensitive OR numeric marketId) to its canonical
+    marketDisplayName via a LIVE GET /v1/markets -- for the server-side `market=` fills filter (v1.2.1,
+    which takes the display name). SystemExit on an unknown market."""
+    return str(_resolve_market_entry(base, market, prog).get("marketDisplayName"))
 
 
 # ── argparse types ───────────────────────────────────────────────────────────
@@ -302,6 +476,12 @@ def num(value, decimals=2):
     return f"{d:,.{decimals}f}" if d is not None else "-"
 
 
+def cell(v):
+    """Display a value as a table/condensed cell: '' for None (a JSON null or absent key), else str(v).
+    Use instead of str(x.get('k','')) -- that renders a PRESENT-but-null field as the literal 'None'."""
+    return "" if v is None else str(v)
+
+
 # ── time ─────────────────────────────────────────────────────────────────────
 def when(micros):
     """Epoch MICROseconds -> 'YYYY-MM-DD HH:MM:SS' UTC, or '-' if absent/invalid.
@@ -331,6 +511,16 @@ def created_key(row):
     """Sort key by createdAt (use reverse=True for newest-first); missing/bad sorts oldest."""
     try:
         return int(row.get("createdAt"))
+    except (TypeError, ValueError):
+        return -1
+
+
+def updated_key(row):
+    """Sort/cursor key by updatedAt (use reverse=True for newest-first); missing/bad sorts oldest.
+    /v1/orders is newest-first by event time and its from/to filter on updatedAt (epoch us), so the
+    backward-paging cursor keys off updatedAt -- NOT createdAt (see display_orders)."""
+    try:
+        return int(row.get("updatedAt"))
     except (TypeError, ValueError):
         return -1
 
