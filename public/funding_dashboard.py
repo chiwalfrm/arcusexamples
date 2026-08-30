@@ -24,7 +24,7 @@ Output (one row per market, sorted by ticker):
 
   BTC       0.137200% (1hr)  0.553200% (8hr)  2.170400% (24hr) Annualized: 792.20%
   ...
-  Generated: <UTC ts> / Runtime <n> seconds / Backoffs: <n> / Hidden: <n> at default funding / Partial: <n> marked *
+  Generated: <UTC ts> / Runtime <n> seconds / Backoffs: <n> / Hidden: <n> at default funding / Failed: <n> / Partial: <n> marked *
 
 A window with fewer than N hourly points (new market or an API gap) is PARTIAL and would
 understate funding; such values (and the annualized figure) are marked "*" rather than shown
@@ -44,14 +44,13 @@ Failed markets are always named on stderr and counted in the footer's "Failed: N
 import argparse
 import html
 import math
-import os
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from decimal import Decimal
-from arcus_common_public import NETWORKS, dec, get_json as _cpub_get_json   # shared public helpers (formerly local copies)
+from arcus_common_public import add_network_args, run_pipe_safe, NETWORKS, dec, get_json as _cpub_get_json   # shared public helpers (formerly local copies)
 
 
 def _bump_backoffs():
@@ -267,13 +266,7 @@ def main():
     parser.add_argument("--all", action="store_true",
                         help="also show markets sitting exactly at the default funding "
                              "(0.00125%%/hr; hidden by default as they carry no signal)")
-    net = parser.add_mutually_exclusive_group(required=True)
-    net.add_argument("--testnet", dest="network", action="store_const", const="testnet",
-                     help="query the testnet server")
-    net.add_argument("--staging", dest="network", action="store_const", const="staging",
-                     help="query the staging server")
-    net.add_argument("--mainnet", dest="network", action="store_const", const="mainnet",
-                     help="query the mainnet server")
+    add_network_args(parser)
     args = parser.parse_args()
     if not math.isfinite(args.delay) or args.delay < 0:
         raise SystemExit("funding_dashboard: --delay must be a finite value >= 0.")
@@ -333,13 +326,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except BrokenPipeError:
-        # A downstream reader closed early (e.g. `... | head`). Point stdout at devnull so the interpreter's
-        # shutdown flush can't re-raise BrokenPipeError, then exit cleanly -- this tool is meant for piping.
-        try:
-            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        except Exception:
-            pass
-        sys.exit(0)
+    run_pipe_safe(main)
