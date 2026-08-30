@@ -24,7 +24,7 @@ from decimal import Decimal, InvalidOperation
 import aiohttp
 import websockets
 from aiohttp import web
-from arcus_common_public import NETWORKS, PUB_RECREATE_AFTER, PUB_SOCKET_TIMEOUT, REDIS_URL, _PUB_ERR_THROTTLE, describe_error, emit as _emit, log_ts, markets_cache_path, now_iso, plan_reconnect_sleep, positive_int, read_markets_cache, require_dict, setup_logger, write_markets_cache, ws_url   # shared public helpers (formerly local copies)
+from arcus_common_public import SUB_ERR_LIMIT, NETWORKS, PUB_RECREATE_AFTER, PUB_SOCKET_TIMEOUT, REDIS_URL, _PUB_ERR_THROTTLE, describe_error, emit as _emit, log_ts, markets_cache_path, now_iso, plan_reconnect_sleep, positive_int, read_markets_cache, require_dict, SubscriptionError, setup_logger, write_markets_cache, write_pidfile, ws_url   # shared public helpers (formerly local copies)
 
 try:
     import redis.asyncio as aioredis      # OPTIONAL dependency: absent => the BBO→Redis feature is simply off
@@ -116,6 +116,8 @@ class OrderBook:
             if not key.is_finite():                 # Decimal() accepts "NaN"/"Infinity" -- a non-finite PRICE can't be
                 continue                            # a real level; it leaks into the served /orderbook and NaN-keys the
                                                     # payload() Decimal sort (-> HTTP 500). Drop the row.
+            if key <= 0:                            # a non-positive PRICE is not a real level -> drop (would otherwise be
+                continue                            # stored and served/rendered in the local L2 HTTP book as a bad level)
             try:
                 dsize = Decimal(size)
             except (InvalidOperation, TypeError, ValueError):
@@ -124,6 +126,8 @@ class OrderBook:
                                                     # dsize=None and fell through, STORING the bad size to be served.)
             if not dsize.is_finite():               # non-finite SIZE ("NaN"/"Infinity") -> malformed -> drop
                 continue
+            if dsize < 0:                           # a NEGATIVE size is malformed -> drop (0 is the valid "remove level"
+                continue                            # signal handled just below; only strictly-positive sizes are levels)
             if dsize == 0:                          # explicit removal
                 book.pop(key, None)
             else:
@@ -318,6 +322,13 @@ async def handle_frame(raw, book, loggers, add_ts, pub, key, state):
     if not isinstance(msg, dict):               # valid JSON but not an object -> stdout, keep reading
         print(raw)
         return
+    # A server subscription/request error: a channel-less frame with an `error` object or an HTTP-like
+    # status >= 400 (WS 'Errors' docs). Raise -> ws_loop reconnects (resubscribe) instead of sitting on a
+    # dead subscription. Gated on channel-less so a real channel frame (which carries `channel`) never matches.
+    if msg.get("channel") is None and (isinstance(msg.get("error"), dict)
+                                       or (isinstance(msg.get("status"), int) and msg["status"] >= 400)):
+        err = msg.get("error") if isinstance(msg.get("error"), dict) else {}
+        raise SubscriptionError(err.get("message") or f"status {msg.get('status')}: {err or msg}")
     channel = msg.get("channel")
     if channel == "bbo":
         # Native best-bid/offer -> Redis (no file log: high-frequency, Redis is its sink). ON-CHANGE: write
@@ -357,6 +368,7 @@ async def handle_frame(raw, book, loggers, add_ts, pub, key, state):
 
 async def ws_loop(url, subscriptions, book, loggers, add_ts, pub, key, reconnect_interval=None):
     delay = RECONNECT_BASE
+    sub_errs = 0                               # consecutive subscription rejections; reset once a connection is stable
     while True:
         conn_start = None
         backoff = True                         # sleep+backoff before reconnecting, UNLESS a seq-gap (resync now)
@@ -404,6 +416,14 @@ async def ws_loop(url, subscriptions, book, loggers, add_ts, pub, key, reconnect
             print(f"[{log_ts()}] [seq gap] {e} — resubscribing for a fresh snapshot", file=sys.stderr)
             book.reset()
             backoff = False                    # immediate resync, no backoff (only a GENUINE seq gap reaches here now)
+        except SubscriptionError as e:
+            # Reconnectable, not fatal: resubscribe on a fresh socket with the normal backoff. Give up only
+            # after SUB_ERR_LIMIT rejections in a row with no stable connection between (a genuinely bad sub).
+            book.reset()
+            sub_errs += 1
+            if sub_errs >= SUB_ERR_LIMIT:
+                raise SystemExit(f"wsorderbook: subscription rejected {sub_errs}x in a row, giving up: {e}")
+            print(f"[{log_ts()}] [sub error] {e} — resubscribing (attempt {sub_errs}, with backoff)", file=sys.stderr)
         except websockets.ConnectionClosedOK:
             # Redis branch only: a clean server close surfaces as an exception (unlike async-for). Treat
             # it exactly like the clean-close path above (reset + normal backoff), NOT as an error.
@@ -412,6 +432,8 @@ async def ws_loop(url, subscriptions, book, loggers, add_ts, pub, key, reconnect
         except Exception as e:
             print(f"[{log_ts()}] [ws error] {describe_error(e)} — reconnecting", file=sys.stderr)   # actual delay set after the stability reset below
             book.reset()
+        if conn_start is not None and time.monotonic() - conn_start >= STABLE_AFTER:
+            sub_errs = 0                        # the connection proved stable => subscriptions are fine
         # Sleep/backoff for a clean close OR an error (NOT a seq-gap). Previously a CLEAN close skipped
         # every except and busy-looped at 0 delay; and resetting delay on connect defeated backoff on a
         # flap. Now: reset delay only if the connection proved STABLE (>= STABLE_AFTER s), then sleep.
@@ -565,6 +587,7 @@ def main():
         args.url = WS_URL
     if args.log_dir is None:
         args.log_dir = os.path.join(LOG_BASE, args.network)
+    write_pidfile(args.log_dir, f"wsorderbook-{args.market}")   # liveness marker: monitor checks the PID is alive
     try:
         asyncio.run(amain(args))
     except KeyboardInterrupt:
