@@ -3,30 +3,35 @@ Modify (cancel + replace) an open order on Arcus, identified by orderId (the API
 requires it) and/or clientId.
 
   # convenience: identify by clientId; ONE openOrders lookup resolves the orderId,
-  # the clientId echo, the immutable fields, and any omitted price/quantity.
+  # the immutable fields, and any omitted price/quantity.
   python3 modify_order.py --clientid mmbid1 --price 41800 --quantity 0.002 --testnet
   python3 modify_order.py --clientid mmbid1 --price 41800 --testnet     # reprice only
   python3 modify_order.py --orderid 0xabc123 --quantity 0.002 --testnet # resize only
 
   # FAST PATH (no server call, for tight loops): pass --orderid + all immutables
-  # (--market --side --tif) + BOTH --price and --quantity. Pass --clientid too if the
-  # order has one (it's the signed echo) and --reduce-only if it's reduce-only.
-  python3 modify_order.py --orderid 0xabc123 --clientid mmbid1 \
+  # (--market --side --tif) + BOTH --price and --quantity, plus --reduce-only if it's
+  # reduce-only, and DO NOT pass --clientid (passing it forces a lookup to validate it,
+  # since it is used as a cross-check and never sent to the venue).
+  python3 modify_order.py --orderid 0xabc123 \
       --price 41800 --quantity 0.002 --market BTC-USD --side BUY --tif GTT --testnet
 
-Identify with --orderid and/or --clientid (at least one). The API ALWAYS identifies
-a modify by orderId; --clientid alone is resolved to the orderId via the lookup.
-The orderId is preserved across modifies, so it's a stable handle to cache.
+Identify with --orderid and/or --clientid (at least one). The venue ALWAYS identifies a
+modify by orderId AND requires EXACTLY ONE of orderId/clientId (sending both -> HTTP 400),
+so clientId is used only to LOOK UP the order (resolved to its orderId) and is never echoed.
+The orderId is preserved across modifies, so it's a stable handle to cache; the replacement
+also keeps the order's original clientId (verified live), so clientId-based tracking survives.
 
 What modifyOrder is: the server does an atomic cancel + replace (orderId preserved).
-Only `price`/`quantity`/`goodTilTime` change; `side`, `timeInForce`, `marketId`,
-`reduceOnly`, and the `clientId` are IMMUTABLE and verified against the resting order
-(mismatch -> rejected). When we look the order up, supplied overrides are checked first.
+Only `price`/`quantity`/`goodTilTime` change; `side`, `timeInForce`, `marketId`, and
+`reduceOnly` are IMMUTABLE and verified against the resting order (mismatch -> rejected).
+When we look the order up, supplied overrides are checked first.
 
 Signing (see ordersign.py): modifyOrder is the TYPED payload op=3
-  {ad,ai,[c,]ct,g,[id,]m,op,p,q,r,s,t,v} -- orderId required; clientId is the signed
-  immutable echo; goodTilTime/reduceOnly/side/timeInForce are all part of the signature.
-Every replacement carries a fresh goodTilTime >= 1 month out (365 days).
+  {ad,ai,[c,]ct,g,[id,]m,op,p,q,r,s,t,v} -- orderId (`id`) required and is the SOLE
+  identifier we send; we omit `c` (clientId) so the venue's exactly-one rule is satisfied.
+  goodTilTime/reduceOnly/side/timeInForce are all part of the signature.
+goodTilTime: a same-price size-reduce REUSES the resting order's goodTilTime so the venue keeps the order
+IN PLACE (preserving queue priority); every other modify uses a fresh goodTilTime >= 1 month out (365 days).
 
 Resolves ordersign.py / arcus_redis.py / arcus_creds_<network>.json relative to this script.
 """
@@ -44,7 +49,7 @@ sys.path.insert(0, _HERE)
 import arcus_redis as marketcache
 import ordersign
 from ordersign import Signer
-from arcus_common_private import (add_network_args, call, check_order_response, dec, fetch_open_orders, load_creds, positive_decimal,
+from arcus_common_private import (add_network_args, call, check_order_response, clock_delta, dec, fetch_open_orders, load_creds, positive_decimal,
                           select_network, server_clock_shim, to_quantums, to_ticks, validate_client_id)
 
 TIFS = ("GTT", "IOC", "FOK", "ALO")
@@ -58,8 +63,8 @@ GOOD_TIL_DAYS = 365
 def parse_args():
     parser = argparse.ArgumentParser(description="Modify an open order by clientId/orderId (cancel + replace).")
     parser.add_argument("--clientid", "--client-id", dest="client_id",
-                        help="the order's clientId — usable alone to identify it, and "
-                             "sent as the signed immutable echo")
+                        help="the order's clientId — used to look up the order (the modify itself is "
+                             "always identified to the venue by orderId; clientId is not echoed)")
     parser.add_argument("--orderid", metavar="ID",
                         help="server order ID (the API identifies a modify by this); pass it "
                              "with --market/--side/--tif/--price/--quantity to skip the lookup")
@@ -99,16 +104,22 @@ def main():
     signer = Signer.from_private_key_hex(creds["api_private_key"])
 
     query = urllib.parse.urlencode({"address": address})
-    ident_desc = f"clientId {args.client_id}" if args.client_id else f"orderId {args.orderid}"
+    # orderId-first, to MATCH the lookup below (which locates by orderId when --orderid is present and only
+    # falls back to clientId otherwise). If this were clientId-first, a "not found" error on a bad --orderid
+    # passed alongside a valid --clientid would wrongly blame the clientId.
+    ident_desc = f"orderId {args.orderid}" if args.orderid else f"clientId {args.client_id}"
 
-    # The API REQUIRES orderId to identify a modify; clientId is a signed echo of the
-    # resting order's clientId (engine rejects a mismatch). FAST PATH (no lookup):
-    # --orderid present + all immutables (--market/--side/--tif) + BOTH --price/--quantity.
-    # Otherwise ONE openOrders lookup resolves the orderId, recovers the clientId echo +
-    # immutable fields, and supplies any omitted price/quantity.
+    # The API REQUIRES orderId to identify a modify (and rejects sending both orderId+clientId), so a
+    # --clientid is only used to LOOK UP + validate the order, never echoed. FAST PATH (no lookup):
+    # --orderid present + all immutables (--market/--side/--tif) + BOTH --price/--quantity + NO --clientid.
+    # Otherwise ONE openOrders lookup resolves the orderId, recovers the immutable fields (and validates
+    # a supplied --clientid against the order's actual clientId), and supplies any omitted price/quantity.
+    # A passed --clientid ALWAYS forces the lookup: since we no longer echo it, the only way it can act as a
+    # cross-check is to validate it against the resting order -- otherwise a wrong --clientid on the fast path
+    # would be silently ignored (the assertion "this order is clientId X" would be a no-op).
     have_all_immutable = bool(args.market and args.side and args.tif)
     have_both_pq = args.price is not None and args.quantity is not None
-    need_lookup = not (args.orderid and have_all_immutable and have_both_pq)
+    need_lookup = bool(args.client_id) or not (args.orderid and have_all_immutable and have_both_pq)
 
     match = None
     if need_lookup:
@@ -210,38 +221,70 @@ def main():
     price_ticks = to_ticks(price, mkt["tickSize"])
     quantity_quantums = to_quantums(quantity, mkt["stepSize"])
 
-    # Replacement order needs a fresh goodTilTime >= 1 month out (local clock; 365d clears the minimum
-    # regardless of small drift). modify's X-Timestamp IS generated inside ordersign (sign_modify_order's
-    # internal time.time_ns), but the sign call below is wrapped in server_clock_shim() so /v1/time DOES
-    # align that X-Timestamp -- a drifted clock can't push it outside the server's +/-30 s auth window.
-    good_til_us = str(int(time.time() * 1_000_000) + GOOD_TIL_DAYS * 86_400 * 1_000_000)
+    # QUEUE PRIORITY (venue contract): a modify is applied IN PLACE -- preserving queue priority -- only when
+    # it keeps the SAME price, REDUCES size, AND leaves goodTilTime UNCHANGED. Any price move, size increase,
+    # or differing goodTilTime is an atomic cancel+replace that LOSES priority. This is a manual tool for real
+    # users, so we PRESERVE priority when we can: on a same-price size-reduce (lookup path only -- we need the
+    # resting order's goodTilTime to echo it), reuse the resting goodTilTime instead of stamping a fresh one.
+    # Otherwise (price change, size increase/keep, the fast path with no lookup, or a resting expiry too close
+    # to the venue's ~1-month floor to safely echo) use a fresh 365d expiry. Echoing is harmless when it does
+    # NOT enable in-place (those cases cancel+replace regardless of goodTilTime). NB: in-place vs cancel+replace
+    # is not directly observable (no queue-position field; createdAt resets on every modify), so this follows
+    # the documented contract. (Changelog review #3, 2026-08-20.)
+    # Compute the GTT off the SERVER-corrected clock, and reuse the SAME offset for the sign shim below so
+    # /v1/time is fetched ONCE, not twice. clock_delta() is fail-soft (0 if /v1/time is down -> local clock,
+    # the prior behavior). The 365-day expiry makes drift immaterial to the order, but this keeps the GTT and
+    # the signature's X-Timestamp on one clock (parity with place_order / market_maker).
+    delta_ns = clock_delta()
+    now_us = (time.time_ns() + delta_ns) // 1000
+    fresh_gtt = str(now_us + GOOD_TIL_DAYS * 86_400 * 1_000_000)
+    resting_gtt = dec(str(match.get("goodTilTime"))) if match is not None else None
+    resting_price = dec(str(match.get("price"))) if match is not None else None
+    resting_remaining = dec(str(match.get("remainingSize"))) if match is not None else None
+    one_month_floor_us = now_us + 35 * 86_400 * 1_000_000   # safe margin over the venue's ~1-month minimum
+    preserve_priority = (
+        match is not None
+        and resting_price is not None and dp == resting_price               # SAME price (dp is the resolved price)
+        and resting_remaining is not None and dq < resting_remaining        # REDUCED size
+        and resting_gtt is not None and resting_gtt >= one_month_floor_us   # resting expiry still safely >= 1 month out
+    )
+    good_til_us = str(int(resting_gtt)) if preserve_priority else fresh_gtt
 
     kept = [n for n, v in (("price", args.price), ("quantity", args.quantity)) if v is None]
     src = "overrides (no lookup)" if not need_lookup else f"openOrders ({ident_desc})"
-    echo_note = f" clientId={client_echo}" if client_echo else " (no clientId)"
+    echo_note = f" (order's clientId {client_echo}, not echoed)" if client_echo else ""
     print(f"MODIFY orderId {order_id}{echo_note}  {side} {quantity} {market_name} @ {price}  "
           f"tif={tif} reduceOnly={reduce_only}")
     print(f"  fields from: {src}" + (f"; kept current {', '.join(kept)}" if kept else ""))
+    if preserve_priority:
+        print("  same price + reduced size: keeping the resting goodTilTime to preserve queue priority "
+              "(in-place modify per the venue contract)")
 
     # --- Sign the typed modify payload (op=3), then POST ----------------------
-    # server_clock_shim(): sign_modify_order mints its X-Timestamp from an internal time.time_ns(); the shim
-    # server-aligns it so a drifted local clock can't 401 the modify (parity with place_order/close_position).
-    with server_clock_shim():
+    # server_clock_shim(delta_ns): sign_modify_order mints its X-Timestamp from an internal time.time_ns(); the
+    # shim server-aligns it so a drifted local clock can't 401 the modify (parity with place_order/close_position).
+    # Reuses the delta measured above for the GTT, so no second /v1/time round-trip.
+    with server_clock_shim(delta_ns):
         headers = signer.sign_modify_order(
             address=address, account_index=account_index, market_id=market_id,
             price_ticks=price_ticks, quantity_quantums=quantity_quantums,
             good_til_time_ns_=ordersign.good_til_time_ns(good_til_us),
             reduce_only=reduce_only, side=SIDES[side], time_in_force=TIF_INT[tif],
-            order_id=order_id, client_id=client_echo,
+            order_id=order_id, client_id=None,     # identify by orderId ONLY -- see below
         )
+    # Identify the modify by orderId ONLY: the venue requires EXACTLY ONE of orderId/clientId in BOTH the
+    # signed payload AND the body -- sending both is rejected (HTTP 400 "provide exactly one of orderId or
+    # clientId (not both)"; verified live 2026-08-20). ordersign requires order_id anyway, so we omit the
+    # clientId echo (client_id=None above -> no `c` in the canonical payload) and DON'T put clientId in the
+    # body. A --clientid arg is still used to LOOK UP + validate the order above; it is just not echoed. The
+    # replacement keeps the order's original clientId regardless (verified live), so nothing downstream that
+    # tracks orders by clientId (e.g. the market maker) is affected.
     body = {
         "address": address, "accountIndex": account_index, "marketId": market_id,
         "orderId": order_id, "side": side, "timeInForce": tif,
         "price": price, "quantity": quantity, "reduceOnly": reduce_only,
         "goodTilTime": good_til_us,
     }
-    if client_echo:
-        body["clientId"] = client_echo
 
     resp = call("POST", f"/v1/modifyOrder?{query}", body, headers)
     print("Modify response:", json.dumps(resp, indent=2))
