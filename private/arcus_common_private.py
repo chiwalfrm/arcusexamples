@@ -1,6 +1,6 @@
 """
-Shared helpers for the Arcus order/signing CLIs:
-place_order.py, modify_order.py, cancel_order.py, market_maker.py.
+Shared helpers for the Arcus private CLIs (order/signing, trading, and monitoring):
+place_order.py, modify_order.py, cancel_order.py, close_position.py, market_maker.py, account_poller.py, marketdata_monitor.py.
 
 Lives in private/ next to ordersign.py / arcus_redis.py / arcus_creds_<network>.json and
 resolves them relative to ITS OWN location, so importers work from any cwd.
@@ -188,6 +188,58 @@ def retry_after_seconds(e, default=1.0, cap=30.0):
         if not math.isfinite(secs):            # "nan"/"inf" parse fine; make finiteness EXPLICIT (don't rely on the
             secs = default                     # max/min arg-order to neutralize a non-finite header) -> clean default
     return max(default, min(secs, cap))
+
+
+def rate_limit_details(e, default=1.0, cap=30.0):
+    """For a 429 HTTPError, return (backoff_seconds, reason, detail); None if `e` is not a 429.
+
+    Unlike retry_after_seconds() (header-only), this READS THE BODY ONCE to get the venue's
+    ms-precise `retryAfterMs` -- the docs recommend preferring it over the `Retry-After` header,
+    which is whole seconds ROUNDED UP (so it never under-waits but can overshoot by <1s) -- and the
+    `reason` (ip|account_empty|account_partial|unknown), useful because order writes cost 0 IP weight,
+    so a 429 while placing at a modest rate is usually shared-IP READ traffic, not the order pool.
+
+    Backoff: body retryAfterMs (preferred) else the header else `default`, clamped to [default, cap].
+    Because this CONSUMES e.read(), the caller must NOT also call describe_error(e) on the same error
+    -- the 429 path raises RateLimited and never does; a non-JSON body (e.g. Cloudflare's 1015 edge
+    limiter) just yields reason=None and the header/default backoff."""
+    if not (isinstance(e, urllib.error.HTTPError) and e.code == 429):
+        return None
+    secs = None
+    hdrs = getattr(e, "headers", None)
+    raw = hdrs.get("Retry-After") if hdrs else None
+    if raw:
+        try:
+            v = float(raw)
+            if math.isfinite(v):
+                secs = v                          # header fallback (whole seconds, rounded up)
+        except (TypeError, ValueError):
+            pass                                  # HTTP-date form / junk -> ignore, use body or default
+    reason = None
+    try:
+        body_txt = e.read().decode("utf-8", "replace")
+    except Exception:
+        body_txt = ""
+    if body_txt:
+        try:
+            obj = json.loads(body_txt)
+        except (ValueError, TypeError):
+            obj = None                            # non-JSON (Cloudflare 1015 text) -> header/default only
+        if isinstance(obj, dict):
+            ms = obj.get("retryAfterMs")
+            if isinstance(ms, (int, float)) and not isinstance(ms, bool) and math.isfinite(ms) and ms >= 0:
+                secs = ms / 1000.0                # PREFER the ms-precise body value over the rounded-up header
+            r = obj.get("reason")
+            if isinstance(r, str):
+                reason = r
+    if secs is None:
+        secs = default
+    secs = max(default, min(secs, cap))
+    detail = "rate limited" + (f" (reason={reason})" if reason else "")
+    snippet = body_txt.strip().replace("\n", " ")[:120]
+    if snippet:
+        detail += f": {snippet}"
+    return secs, reason, detail
 
 
 _SESSION = None
@@ -423,3 +475,149 @@ def resolve_market(markets, ident):
         return next((m for m in markets if isinstance(m, dict) and str(m.get("marketId")) == str(int(ident))), None)
     up = ident.upper()
     return next((m for m in markets if isinstance(m, dict) and str(m.get("marketDisplayName", "")).upper() == up), None)
+
+
+# ── Shared MARKET-order (IOC) placement ──────────────────────────────────────────
+# The book-walk + slippage guard + protective-bound + sign/POST, shared by place_order.py AND pivot_trader.py
+# so the market-order logic lives in ONE place. See place_order.py's module docstring for the guard rationale.
+MARKET_MAX_SLIPPAGE     = Decimal("0.03")   # est. avg fill vs mid: refuse beyond this unless force=True
+MARKET_PRICE_BUFFER     = Decimal("0.01")   # normal protective bound = worst consumed level +/- 1%
+MARKET_FORCE_MARK_BOUND = Decimal("0.09")   # force bound = markPrice +/- 9% (stays under the API's 10%-of-mark cap)
+MARKET_GOOD_TIL_DAYS    = 365               # every order needs a goodTilTime >= 1 month out; 365d clears it
+
+
+def walk_book(levels, qty):
+    """Walk pre-sorted [price, size] levels filling up to `qty` -> (avg, worst, filled, enough)."""
+    remaining, cost, filled, worst = qty, Decimal(0), Decimal(0), None
+    for price_s, size_s in levels:
+        if remaining <= 0:
+            break
+        price, size = Decimal(price_s), Decimal(size_s)
+        take = size if size < remaining else remaining
+        cost += price * take
+        filled += take
+        remaining -= take
+        worst = price_s
+    avg = (cost / filled) if filled > 0 else None
+    return avg, worst, filled, remaining <= 0
+
+
+def place_market_ioc(signer, address, account_index, mkt, side, qty, *, force=False, client_id=None):
+    """Place a MARKET IOC order for `qty` (Decimal, base units) on `side` ("BUY"/"SELL") of `mkt` (a
+    /v1/markets entry). Walks the LIVE l2 book, applies the slippage guard + protective bound exactly like
+    place_order.py, signs (Ed25519), POSTs /v1/placeOrder, and returns:
+
+        {"placed": bool, "reason": str|None, "mid", "avg_fill", "slippage", "worst", "bound",
+         "enough": bool, "order": <response>|None}
+
+    When the slippage guard BLOCKS the order (est. slippage > MARKET_MAX_SLIPPAGE and not force) it returns
+    placed=False / order=None with a human `reason` -- the CALLER decides whether that's fatal (CLI) or a
+    skip-and-retry (bot). Raises SystemExit (fail-closed) on a malformed book, a non-positive/unsafe protective
+    bound, a book dislocated >10% from mark, or a rejected order.
+
+    NOTE: placeOrder is ASYNCHRONOUS -- `order` is the 200/202 body (orderId present; a definitive `filledSize`
+    only on the best-effort 200 path). A caller needing the exact fill must read GET /v1/order/{orderId} after."""
+    if side not in ("BUY", "SELL"):
+        raise SystemExit(f"place_market_ioc: side must be BUY or SELL, got {side!r}.")
+    if not isinstance(qty, Decimal) or not qty.is_finite() or qty <= 0:
+        raise SystemExit(f"place_market_ioc: qty must be a finite positive Decimal, got {qty!r}.")
+    try:
+        market_id = int(mkt["marketId"])
+        tick_size, step_size = mkt["tickSize"], mkt["stepSize"]
+        market_name = mkt["marketDisplayName"]
+        dt, ds = dec(tick_size), dec(step_size)
+        if dt is None or ds is None or dt <= 0 or ds <= 0:
+            raise ValueError
+    except (KeyError, ValueError, TypeError):
+        raise SystemExit("place_market_ioc: market has incomplete/malformed metadata "
+                         "(marketId / tickSize>0 / stepSize>0 / marketDisplayName).")
+
+    ob = call("GET", f"/v1/l2OrderBook/{urllib.parse.quote(market_name)}")
+    if not isinstance(ob, dict):
+        raise SystemExit(f"{market_name}: unexpected /v1/l2OrderBook response (not a JSON object).")
+    bids, asks = ob.get("bids", []), ob.get("asks", [])
+    if not bids or not asks:
+        raise SystemExit(f"{market_name}: order book has no two-sided liquidity.")
+    try:                                    # every level must be a [finite-positive price, finite-positive size]
+        for lv in (*bids, *asks):           # PAIR -- bare Decimal() accepts "NaN"/"Infinity"/negatives, which would
+            if not isinstance(lv, (list, tuple)) or len(lv) != 2:   # flow into mid/slippage and fail the guard OPEN.
+                raise ValueError("level is not a 2-element list")
+            p, s = Decimal(lv[0]), Decimal(lv[1])
+            if not (p.is_finite() and p > 0 and s.is_finite() and s > 0):
+                raise ValueError("level price/size must be finite and positive")
+    except (ArithmeticError, TypeError, ValueError):
+        raise SystemExit(f"{market_name}: malformed order book (level not a finite-positive [price, size] pair).")
+    asks = sorted(asks, key=lambda lv: Decimal(lv[0]))               # defensive: don't trust server ordering
+    bids = sorted(bids, key=lambda lv: Decimal(lv[0]), reverse=True)
+    mid = (Decimal(bids[0][0]) + Decimal(asks[0][0])) / 2
+    levels = asks if side == "BUY" else bids
+
+    avg_fill, worst_price, filled, enough = walk_book(levels, qty)
+    if avg_fill is None:
+        raise SystemExit(f"{market_name}: empty book on the {side} side.")
+    slippage = abs(avg_fill - mid) / mid
+    if not slippage.is_finite():            # non-finite slippage = broken pricing; NEVER place (NaN>MAX is False)
+        raise SystemExit(f"{market_name}: computed slippage is non-finite (mid={mid}, avg_fill={avg_fill}); book malformed.")
+    result = {"placed": False, "reason": None, "mid": mid, "avg_fill": avg_fill, "slippage": slippage,
+              "worst": worst_price, "bound": None, "enough": enough, "order": None}
+    if slippage > MARKET_MAX_SLIPPAGE and not force:
+        result["reason"] = f"est. slippage {slippage * 100:.2f}% exceeds {MARKET_MAX_SLIPPAGE * 100:.0f}% limit"
+        return result
+
+    # Protective bound: normal = worst level +/- 1% (rounded AWAY from mid so tick-rounding can't tighten it);
+    # force = mark +/- 9%. The venue also checks the bound against a 10%-of-mark cap.
+    mark = dec(mkt.get("markPrice"))
+    if force:
+        if mark is None or mark <= 0:
+            mark = mid                      # markPrice missing/zero -> fall back to mid for the force bound
+        target = mark * (1 + MARKET_FORCE_MARK_BOUND) if side == "BUY" else mark * (1 - MARKET_FORCE_MARK_BOUND)
+    else:
+        worst = Decimal(worst_price)
+        target = worst * (1 + MARKET_PRICE_BUFFER) if side == "BUY" else worst * (1 - MARKET_PRICE_BUFFER)
+    bound = round_to_increment(target, tick_size, ROUND_CEILING if side == "BUY" else ROUND_FLOOR)
+    if force:
+        bound = clamp_to_mark_cap(bound, mark, tick_size, side == "BUY")
+    elif mark is not None and mark > 0 and abs(bound - mark) > mark * Decimal("0.10"):
+        raise SystemExit(f"{market_name}: order-book bound {bound} is >10% off markPrice {mark} (the venue's "
+                         "market-order cap); book dislocated -- use a mark-based (force) bound or a LIMIT order.")
+    if bound <= 0:                          # a SELL floor can tick-round to 0 near tickSize -> no protective bound
+        raise SystemExit(f"{market_name}: protective bound rounded to {bound} (<=0); price is within ~1 tick of "
+                         f"tickSize {tick_size}, so a MARKET {side} would carry no protective bound. Refusing.")
+    result["bound"] = bound
+
+    # Pre-validate size/notional against the market's bounds -> a clear error BEFORE signing (else the venue
+    # rejects with OrderSizeTooLarge / a min-size / min-notional reason). Each bound is skipped when absent.
+    min_sz = dec(mkt.get("minOrderSize")); max_sz = dec(mkt.get("maxOrderSize")); min_not = dec(mkt.get("minOrderNotional"))
+    if min_sz is not None and min_sz > 0 and qty < min_sz:
+        raise SystemExit(f"{market_name}: size {qty:f} is below the market minimum order size {min_sz:f} (minOrderSize).")
+    if max_sz is not None and max_sz > 0 and qty > max_sz:
+        raise SystemExit(f"{market_name}: size {qty:f} exceeds the market maximum order size {max_sz:f} (maxOrderSize).")
+    if min_not is not None and min_not > 0 and qty * bound < min_not:
+        raise SystemExit(f"{market_name}: order notional {qty * bound:f} is below the market minimum {min_not:f} (minOrderNotional).")
+
+    # Sign the typed payload + POST. goodTilTime >= 1 month out in SERVER time (correct the local clock).
+    qty_str = f"{qty:f}"
+    price_ticks = to_ticks(f"{bound:f}", tick_size)
+    quantity_quantums = to_quantums(qty_str, step_size)
+    delta_ns = clock_delta()
+    server_us = (time.time_ns() + delta_ns) // 1000
+    good_til_us = str(server_us + MARKET_GOOD_TIL_DAYS * 86_400 * 1_000_000)
+    ct = time.time_ns() + delta_ns          # server-aligned; also the X-Timestamp
+    headers = signer.sign_place_order(
+        address=address, account_index=account_index, client_id=client_id,
+        client_timestamp_ns=ct, good_til_time_ns_=ordersign.good_til_time_ns(good_til_us),
+        market_id=market_id, price_ticks=price_ticks, quantity_quantums=quantity_quantums,
+        reduce_only=False, side=ordersign.SIDE_BUY if side == "BUY" else ordersign.SIDE_SELL,
+        time_in_force=ordersign.TIF_IOC,
+    )
+    body = {"address": address, "accountIndex": account_index, "marketId": market_id,
+            "orderSide": side, "orderType": "MARKET", "quantity": qty_str, "price": f"{bound:f}",
+            "timeInForce": "IOC", "timestamp": ct, "goodTilTime": good_til_us}
+    if client_id:
+        body["clientId"] = client_id
+    path = "/v1/placeOrder?" + urllib.parse.urlencode({"address": address})
+    order = call("POST", path, body, headers)
+    check_order_response(order, "placeOrder")   # a 2xx can still carry status REJECTED/ERROR -> fail closed
+    result["placed"] = True
+    result["order"] = order
+    return result
