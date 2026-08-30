@@ -9,9 +9,8 @@
 
 import argparse
 import csv
-import os
 import sys
-from arcus_common_public import NETWORKS, get_json, market_id_key, markets_cache_path, require_dict, write_markets_cache   # shared public helpers (formerly local copies)
+from arcus_common_public import add_network_args, run_pipe_safe, NETWORKS, cell, get_json, market_id_key, markets_cache_path, require_dict, write_markets_cache   # shared public helpers (formerly local copies)
 
 MARKETS_URL = None   # set in main() from the required --testnet/--staging selector
 
@@ -23,10 +22,13 @@ MARKETS_URL = None   # set in main() from the required --testnet/--staging selec
 # a NETWORK-scoped predictable path for manual use (testnet/staging/mainnet marketId maps differ).
 
 
-# (key, alignment) for the default/condensed common columns.
+# (key, alignment) for the default/condensed common columns. minOrderSize/maxOrderSize (v1.3.8, re-added)
+# sit with tick/step as the order-placement constraints; the rest of the fields (high24h/low24h/
+# openInterestCapNotional/...) are surfaced by --verbose / --verbosecondensed (all_keys).
 COMMON_COLS = [
     ("marketId", ">"), ("marketDisplayName", "<"), ("tickSize", ">"),
-    ("stepSize", ">"), ("oraclePrice", ">"), ("status", "<"),
+    ("stepSize", ">"), ("minOrderSize", ">"), ("maxOrderSize", ">"),
+    ("oraclePrice", ">"), ("status", "<"),
 ]
 
 
@@ -54,14 +56,14 @@ def print_table(markets, cols):
     widths = {k: len(k) for k, _ in cols}
     for m in markets:
         for k, _ in cols:
-            widths[k] = max(widths[k], len(str(m.get(k, ""))))
+            widths[k] = max(widths[k], len(cell(m.get(k))))
     header = "  ".join(f"{k:{align}{widths[k]}}" for k, align in cols)
     separator = "-" * len(header)
     print(f"\n  Markets: {MARKETS_URL}\n")
     print(header)
     print(separator)
     for m in markets:
-        print("  ".join(f"{str(m.get(k, '')):{align}{widths[k]}}" for k, align in cols))
+        print("  ".join(f"{cell(m.get(k)):{align}{widths[k]}}" for k, align in cols))
     print(separator)
     print(f"  {len(markets)} markets\n")
 
@@ -84,22 +86,27 @@ def main():
                        help="aligned table of all fields")
     group.add_argument("--verbosecondensed", action="store_true",
                        help="pipe-delimited all fields (safe for piping)")
-    net = parser.add_mutually_exclusive_group(required=True)
-    net.add_argument("--testnet", dest="network", action="store_const", const="testnet",
-                     help="query the testnet server")
-    net.add_argument("--staging", dest="network", action="store_const", const="staging",
-                     help="query the staging server")
-    net.add_argument("--mainnet", dest="network", action="store_const", const="mainnet",
-                     help="query the mainnet server")
+    add_network_args(parser)
     parser.add_argument("--createjson", action="store_true",
                         help="also write the raw /v1/markets response to "
                              "/tmp/arcus_markets_<network>.json so sibling launcher tools resolve "
                              "markets from that file instead of re-hitting the server")
+    parser.add_argument("--market",
+                        help="show only this market (display name or marketId; the venue added a server-side "
+                             "market filter in v1.4.5, but we filter the already-fetched list so --createjson "
+                             "still caches the FULL set)")
     args = parser.parse_args()
     MARKETS_URL = NETWORKS[args.network] + "/v1/markets"
 
     cache_path = markets_cache_path(args.network) if args.createjson else None
     markets = fetch_markets(cache_path)
+
+    if args.market:   # filter the DISPLAY only (the cache written by fetch_markets stays the full set)
+        want = str(args.market).upper()
+        markets = [m for m in markets if str(m.get("marketDisplayName", "")).upper() == want
+                   or str(m.get("marketId")) == str(args.market)]
+        if not markets:
+            raise SystemExit(f"showmarkets: unknown market {args.market!r} (not found in /v1/markets).")
 
     if args.condensed:
         write_delimited(markets, [k for k, _ in COMMON_COLS], delimiter=",")
@@ -112,13 +119,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except BrokenPipeError:
-        # A downstream reader closed early (e.g. `... | head`). Point stdout at devnull so the interpreter's
-        # shutdown flush can't re-raise BrokenPipeError, then exit cleanly -- this tool is meant for piping.
-        try:
-            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        except Exception:
-            pass
-        sys.exit(0)
+    run_pipe_safe(main)
