@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 import sys
-import os
 import math
 import time
 import json
 import argparse
 import urllib.error
 import urllib.request
-from arcus_common_public import NETWORKS, markets_cache_path, positive_int, read_markets_cache, write_markets_cache   # shared public helpers (formerly local copies)
+from decimal import Decimal, ROUND_DOWN, ROUND_UP, InvalidOperation
+from arcus_common_public import add_network_args, run_pipe_safe, NETWORKS, markets_cache_path, positive_int, read_markets_cache, write_markets_cache, get_json_dict   # shared public helpers (formerly local copies)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 MARKETS_URL = None   # set in main() from the required --testnet/--staging/--mainnet selector
@@ -45,24 +45,10 @@ def fetch_market_id(market: str) -> int:
     else:
         want_id = None
     data = read_markets_cache(MARKETS_CACHE)
-    if data is None:                        # cache miss -> live fetch, then warm the cache
-        try:
-            with urllib.request.urlopen(MARKETS_URL, timeout=10) as r:
-                data = json.loads(r.read())
-        except urllib.error.HTTPError as e:
-            raise SystemExit(f"showorderbook: HTTP {e.code} fetching markets: {e.reason}")
-        except urllib.error.URLError as e:
-            raise SystemExit(f"showorderbook: could not reach {MARKETS_URL}: {e.reason}")
-        except (TimeoutError, OSError) as e:
-            raise SystemExit(f"showorderbook: network error: {e}")
-        except json.JSONDecodeError as e:
-            raise SystemExit(f"showorderbook: invalid JSON from markets API: {e}")
-        # Validate the live body BEFORE using/caching it: the cache reader already trusts only a dict
-        # with a list 'markets', but this fetch path did not -- a non-dict body would AttributeError on
-        # data.get() below (and cache junk). Fail clean, matching read_markets_cache's trust rule.
-        if not isinstance(data, dict):
-            raise SystemExit(f"showorderbook: unexpected /v1/markets response (not a JSON object, got "
-                             f"{type(data).__name__}).")
+    if data is None:                        # cache miss -> live fetch, then warm the cache. get_json_dict adds
+        # what raw urlopen lacked: retries with Retry-After/backoff on 429 (incl. Cloudflare 1015) and 5xx, plus
+        # require_dict (a non-object 2xx body -> clean error, not an AttributeError on data.get() below).
+        data = get_json_dict(MARKETS_URL, "markets", "showorderbook")
         if not isinstance(data.get("markets"), list):
             raise SystemExit("showorderbook: unexpected /v1/markets response ('markets' missing or not a list).")
         write_markets_cache(MARKETS_CACHE, data)
@@ -104,11 +90,45 @@ def clean_levels(levels):
         if not (math.isfinite(p) and math.isfinite(s)):
             dropped += 1
             continue
+        if p <= 0 or s < 0:                      # a non-positive price or a negative size is not a real level ->
+            dropped += 1                         # drop (mirrors the wsorderbook book-apply guard) so a mangled feed
+            continue                             # can't render a nonsensical level in the displayed book
         # Normalize price/size to STRINGS: a NUMERIC price/size (a foreign --server / non-string feed) survives
         # the float() check above but crashes display's split_num (`"." in <float>` -> TypeError). clean_levels'
         # contract is "surviving rows won't traceback in display", so coerce here (str of a str is a no-op).
         clean.append([str(lv[0]), str(lv[1]), *lv[2:]])
     return clean, dropped
+
+
+def _round_sig(price, sig, rounding):
+    """Round a Decimal `price` to `sig` significant figures with the given rounding mode (client-side book
+    aggregation mirroring the venue's REST l2 sigFigs). <=0 passes through."""
+    if price <= 0:
+        return price
+    exp = price.adjusted() - (sig - 1)          # target exponent: 118466.1 (adjusted 5) at sig 2 -> exp 4 (nearest 10^4)
+    return price.quantize(Decimal(1).scaleb(exp), rounding=rounding)
+
+
+def aggregate_levels(levels, sig, round_down):
+    """Merge levels whose price rounds to the same `sig` significant figures, summing sizes -- a client-side
+    aggregated book view (like the venue's REST l2 sigFigs, which this tool can't use because it reads the
+    locally-maintained wsorderbook book, not /v1/l2OrderBook). Bids round DOWN, asks round UP, so a bucket
+    never prices better than the levels it holds (can't manufacture a cross). Input is already price-sorted
+    and rounding is monotonic, so buckets keep that order. Output levels are [price, size] (the per-level
+    seq is dropped -- a merged bucket has no single seq; display renders it as '?')."""
+    rounding = ROUND_DOWN if round_down else ROUND_UP
+    buckets, order = {}, []
+    for lv in levels:
+        try:
+            price, size = Decimal(str(lv[0])), Decimal(str(lv[1]))
+        except (InvalidOperation, IndexError, TypeError):
+            continue
+        key = f"{_round_sig(price, sig, rounding):f}"
+        if key not in buckets:
+            buckets[key] = Decimal(0)
+            order.append(key)
+        buckets[key] += size
+    return [[k, f"{buckets[k]:f}"] for k in order]
 
 
 def resolve_crosses(bids: list, asks: list):
@@ -316,16 +336,13 @@ def main():
     parser.add_argument("market",                                     help="Market symbol (e.g. BTC-USD) or numeric marketId")
     parser.add_argument("--server",  default="localhost",             help="Orderbook server host (default: localhost)")
     parser.add_argument("--nlevels", type=positive_int, default=None,  help="Number of price levels to display (default: all)")
+    parser.add_argument("--sig-figs", type=positive_int, default=None, metavar="N",
+                        help="aggregate the book for display: merge levels whose price rounds to N significant "
+                             "figures (bids round down / asks round up), summing sizes -- like the venue's l2 sigFigs")
     parser.add_argument("--looping", action="store_true",             help="Continuously refresh the orderbook")
     parser.add_argument("--usd",     action="store_true",             help="Show size columns in USD value")
     parser.add_argument("--checkserver", action="store_true",         help="Only verify the orderbook HTTP server responds, then exit (0=up, 1=down)")
-    net = parser.add_mutually_exclusive_group(required=True)
-    net.add_argument("--testnet", dest="network", action="store_const", const="testnet",
-                     help="resolve the market against the testnet server")
-    net.add_argument("--staging", dest="network", action="store_const", const="staging",
-                     help="resolve the market against the staging server")
-    net.add_argument("--mainnet", dest="network", action="store_const", const="mainnet",
-                     help="resolve the market against the mainnet server")
+    add_network_args(parser, verb="resolve the market against")
     args = parser.parse_args()
     MARKETS_URL = NETWORKS[args.network] + "/v1/markets"
     MARKETS_CACHE = markets_cache_path(args.network)
@@ -364,6 +381,10 @@ def main():
 
         crossed = resolve_crosses(bids, asks)
 
+        if args.sig_figs is not None:                     # client-side sigFigs aggregation (crosses resolved first)
+            bids = aggregate_levels(bids, args.sig_figs, round_down=True)
+            asks = aggregate_levels(asks, args.sig_figs, round_down=False)
+
         if args.nlevels is not None:
             bids = bids[:args.nlevels]
             asks = asks[:args.nlevels]
@@ -379,13 +400,4 @@ def main():
         time.sleep(1)
 
 if __name__ == "__main__":
-    try:
-        main()
-    except BrokenPipeError:
-        # A downstream reader closed early (e.g. `... | head`). Point stdout at devnull so the interpreter's
-        # shutdown flush can't re-raise BrokenPipeError, then exit cleanly -- this tool is meant for piping.
-        try:
-            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        except Exception:
-            pass
-        sys.exit(0)
+    run_pipe_safe(main)
