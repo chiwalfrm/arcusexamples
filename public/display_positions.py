@@ -2,6 +2,7 @@
 Display open positions for an account.
 
   python3 display_positions.py <eth_address>
+  python3 display_positions.py <eth_address> --market BTC-USD   # only that market's position
   python3 display_positions.py <eth_address> --condensed   # CSV market,quantity (for scripts)
 
 Uses GET /v1/positions, a public account-scoped read that takes only the
@@ -16,15 +17,12 @@ venue then falls back to the entry price for its notional / PnL math).
 
 import argparse
 import csv
-import os
-import re
 import sys
 import urllib.parse
 from decimal import Decimal
-from arcus_common_public import NETWORKS, dec, get_json_dict, market_id_key, num   # shared public helpers (formerly local copies)
+from arcus_common_public import add_network_args, require_eth_address, run_pipe_safe, NETWORKS, cell, dec, get_json_dict, market_id_key, num   # shared public helpers (formerly local copies)
 
 BASE = None   # set in main() from the required --testnet/--staging/--mainnet selector
-ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 
 def funding_of(p):
@@ -42,28 +40,36 @@ def mark_str(p):
 
 # (header, alignment, value-getter -> display string). Widths are sized to data.
 COLS = [
-    ("MARKET", "<", lambda p: str(p.get("marketDisplayName", ""))),
-    ("SIDE", "<", lambda p: str(p.get("side", ""))),
+    ("MARKET", "<", lambda p: cell(p.get("marketDisplayName"))),
+    ("SIDE", "<", lambda p: cell(p.get("side"))),
     ("SIZE", ">", lambda p: num(p.get("size"), 4)),
     ("ENTRY", ">", lambda p: num(p.get("averageEntryPrice"))),
     ("MARK", ">", mark_str),
-    ("LEV", ">", lambda p: str(p.get("leverage", ""))),
-    ("MARGIN", "<", lambda p: str(p.get("marginMode", ""))),
+    ("LEV", ">", lambda p: cell(p.get("leverage"))),
+    ("MARGIN", "<", lambda p: cell(p.get("marginMode"))),
     ("NOTIONAL", ">", lambda p: num(p.get("positionValueNotional"))),
     ("uPnL", ">", lambda p: num(p.get("unrealizedPnl"))),
     ("FUNDING", ">", lambda p: num(funding_of(p))),
 ]
 
 
-def fetch_positions(address):
-    """GET /v1/positions -> dict keyed by marketId; clean CLI errors on failure."""
-    query = urllib.parse.urlencode({"address": address})
+def fetch_positions(address, market=None):
+    """GET /v1/positions -> dict keyed by marketId; clean CLI errors on failure. `market` (display name or
+    numeric id) applies the SERVER-SIDE market filter (v0.1.10.0); None = all markets (an unknown market -> 400)."""
+    q = {"address": address}
+    if market is not None:
+        q["market"] = market
+    query = urllib.parse.urlencode(q)
     # Shared retrying reader: Retry-After/backoff on 429 (incl. Cloudflare 1015) + 5xx, and require_dict
     # (so a non-object 2xx body is a clean error, not a .get AttributeError) -- robust for cron/ops.
     data = get_json_dict(f"{BASE}/v1/positions?{query}", "positions", "display_positions")
     positions = data.get("positions")
     if positions is None:
-        return {}
+        # UNKNOWN != flat: a flat account returns an empty OBJECT {}, so a MISSING/null 'positions' is a
+        # malformed/unreadable response, NOT "no open positions". Treating it as flat is fail-OPEN -- it would
+        # print "0 open position(s)" and mislead ops. Fail closed (matches close_position's unknown!=flat).
+        raise SystemExit("display_positions: 'positions' missing/null in /v1/positions response -- account state "
+                         "UNKNOWN (NOT treating as flat). Retry.")
     if not isinstance(positions, dict):
         raise SystemExit("display_positions: unexpected 'positions' shape (expected object).")
     return {mid: p for mid, p in positions.items() if isinstance(p, dict)}   # drop non-dict values so downstream .get() can't crash
@@ -73,29 +79,28 @@ def main():
     global BASE
     parser = argparse.ArgumentParser(description="Display open positions for an account.")
     parser.add_argument("address", help="Ethereum address of the account to display")
+    parser.add_argument("--market",
+                        help="show only this market's position (display name or numeric marketId; "
+                             "server-side filter, v0.1.10.0; default: all)")
     parser.add_argument("--condensed", action="store_true",
                         help="machine-readable: CSV 'market,quantity' per line, "
                              "raw values (no header, no totals)")
     parser.add_argument("--header", action="store_true",
                         help="with --condensed, emit a CSV header row first "
                              "(error if used without --condensed)")
-    net = parser.add_mutually_exclusive_group(required=True)
-    net.add_argument("--testnet", dest="network", action="store_const", const="testnet",
-                     help="query the testnet server")
-    net.add_argument("--staging", dest="network", action="store_const", const="staging",
-                     help="query the staging server")
-    net.add_argument("--mainnet", dest="network", action="store_const", const="mainnet",
-                     help="query the mainnet server")
+    add_network_args(parser)
     args = parser.parse_args()
     BASE = NETWORKS[args.network]
-    if not ADDR_RE.match(args.address):
-        raise SystemExit(f"display_positions: invalid Ethereum address {args.address!r} "
-                         f"(expected 0x + 40 hex chars).")
+    require_eth_address(args.address, "display_positions")
     if args.header and not args.condensed:
         raise SystemExit("display_positions: --header requires --condensed.")
 
-    positions = sorted((p for p in fetch_positions(args.address).values() if isinstance(p, dict)),
+    positions = sorted((p for p in fetch_positions(args.address, args.market).values() if isinstance(p, dict)),
                        key=market_id_key)   # drop any null/non-dict position value defensively
+    if args.market:   # defensive local match (the server already filtered + 400s a typo); accepts name OR id
+        want = str(args.market).upper()
+        positions = [p for p in positions
+                     if str(p.get("marketDisplayName", "")).upper() == want or str(p.get("marketId")) == str(args.market)]
 
     if args.condensed:
         # Raw signed quantity straight from the API, CSV-escaped for downstream scripts.
@@ -106,7 +111,8 @@ def main():
             writer.writerow([p.get("marketDisplayName", ""), p.get("size", "")])
         return
 
-    print(f"{len(positions)} open position(s) for {args.address}\n")
+    scope = f" in {args.market}" if args.market else ""
+    print(f"{len(positions)} open position(s){scope} for {args.address}\n")
     if not positions:
         return
 
@@ -128,13 +134,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except BrokenPipeError:
-        # A downstream reader closed early (e.g. `... | head`). Point stdout at devnull so the interpreter's
-        # shutdown flush can't re-raise BrokenPipeError, then exit cleanly -- this tool is meant for piping.
-        try:
-            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        except Exception:
-            pass
-        sys.exit(0)
+    run_pipe_safe(main)
