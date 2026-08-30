@@ -7,19 +7,25 @@ is in the account (it never reads the account position -- manual/human trades ar
 
   # arm it once (sets P and q, records the starting side, stays flat, waits for a flip):
   pivot_trader.py --init --market BTC-USD --pivot 64000 --quantity 0.5 --mainnet
+  #   optional directional bias (locked at --init, mutually exclusive): --long-only | --short-only
 
   # cron runs it (no P/q needed -- read from the state file):
   pivot_trader.py --market BTC-USD --mainnet
+
+Directional mode (locked at --init, stored in state; default when neither flag is given):
+  both        -> +q bullish / -q bearish   -- the default stop-and-reverse (flips into the opposite quantity).
+  --long-only -> +q bullish / 0 bearish    -- only ever long; a bearish flip FLATTENS to 0, then waits to re-buy.
+  --short-only-> -q bearish / 0 bullish     -- only ever short; a bullish flip FLATTENS to 0, then waits to re-sell.
 
 Per-run logic (normal mode):
   1. flock (one instance at a time).  2. Load state (error if none -- run --init first).
   3. Read the oracle (Redis 'markets' cache if present, else REST /v1/markets; must be finite > 0, else SKIP).
   4. side = bullish if oracle >= P else bearish.
   5. If position == 0 and side == starting_side -> WAIT (still on the entry side; first trade fires on a flip).
-     Else target = +q (bullish) / -q (bearish); delta = target - position; trade the delta at market (IOC).
-  This one `delta = target - position` gives the 1x first trade, the 2x flip, and self-correcting top-ups
-  (a rare short fill is picked up next run) -- no partial fill can compound because `position` only moves by
-  the ACTUAL fill (read from GET /v1/order/{orderId}, since placeOrder is async).
+     Else target = target_position(side, q, direction); delta = target - position; trade the delta at market (IOC).
+  This one `delta = target - position` gives the 1x first trade, the 2x flip (both mode) or the flatten (long/
+  short-only), and self-correcting top-ups (a rare short fill is picked up next run) -- no partial fill can
+  compound because `position` only moves by the ACTUAL fill (read from GET /v1/order/{orderId}, async placeOrder).
 
 State file: pivot_state_<network>_<market>.json in the CWD (locked convention, not overridable). One bot per
 directory. `position` is the bot's OWN net (sum of its own fills); deleting the file = "roll to the next pivot"
@@ -146,6 +152,20 @@ def side_of(oracle, pivot):
     return "bullish" if oracle >= pivot else "bearish"
 
 
+def target_position(side, q, direction):
+    """The bot's desired SIGNED position for the current side, given the directional mode locked at --init.
+      both  -> +q bullish / -q bearish   (default stop-and-reverse: flips into the opposite quantity).
+      long  -> +q bullish / 0 bearish    (long-only: a bearish flip just FLATTENS to 0, then waits to re-buy).
+      short -> -q bearish / 0 bullish     (short-only: a bullish flip just FLATTENS to 0, then waits to re-sell).
+    delta = target - position then yields the flatten order for free (e.g. long +q, flip bearish -> target 0 ->
+    delta -q -> SELL q)."""
+    if direction == "long":
+        return q if side == "bullish" else Decimal(0)
+    if direction == "short":
+        return -q if side == "bearish" else Decimal(0)
+    return q if side == "bullish" else -q
+
+
 def min_trade_size(mkt):
     """Smallest size the bot will place: the market's minOrderSize, or the step size if that's absent."""
     ms = dec(mkt.get("minOrderSize"))
@@ -259,12 +279,15 @@ def do_init(args):
     if mn > 0 and q < mn:
         raise SystemExit(f"{PROG}: --quantity {q} is below the market minimum order size {mn}.")
 
+    direction = "long" if args.long_only else "short" if args.short_only else "both"
     starting_side = side_of(oracle, pivot)
     now = _now_iso()
-    state = {"pivot": str(pivot), "quantity": str(q), "starting_side": starting_side,
+    state = {"pivot": str(pivot), "quantity": str(q), "starting_side": starting_side, "direction": direction,
              "position": "0", "pending_order_id": None, "created_at": now, "updated_at": now}
     save_state(path, state)
-    log(f"[INIT {market_name}] pivot={pivot} q={q}  oracle={oracle} -> starting side {starting_side}; "
+    mode_note = {"both": "flip +q<->-q", "long": "LONG-ONLY (flatten on bearish)",
+                 "short": "SHORT-ONLY (flatten on bullish)"}[direction]
+    log(f"[INIT {market_name}] pivot={pivot} q={q} [{mode_note}]  oracle={oracle} -> starting side {starting_side}; "
         f"position 0. Idle until the oracle crosses the pivot. State: {os.path.basename(path)}")
 
 
@@ -281,6 +304,9 @@ def do_run(args):
             raise SystemExit(f"{PROG}: state file {os.path.basename(path)} is missing '{k}'.")
     pivot = dec(state["pivot"]); q = dec(state["quantity"])
     starting_side = state["starting_side"]
+    direction = state.get("direction", "both")   # older state files predate this field -> default flip strategy
+    if direction not in ("both", "long", "short"):
+        raise SystemExit(f"{PROG}: state file has an invalid direction {direction!r} (expected both/long/short).")
     if pivot is None or q is None or dec(state["position"]) is None:
         raise SystemExit(f"{PROG}: state file has a non-numeric pivot/quantity/position.")
 
@@ -302,12 +328,12 @@ def do_run(args):
     if position == 0 and side == starting_side:
         log(f"[{market_name}] oracle={oracle} pivot={pivot} -> {side} (== starting side); waiting for a flip, no trade")
         return
-    target = q if side == "bullish" else -q
+    target = target_position(side, q, direction)
     delta = target - position
     ms = min_trade_size(mkt)
     if delta == 0 or abs(delta) < ms:
         log(f"[{market_name}] oracle={oracle} -> {side}; position {position} at/near target {target} "
-            f"(delta {delta} < min {ms}); no trade")
+            f"({direction}); delta {delta} < min {ms}; no trade")
         return
     execute_trade(signer, address, account_index, mkt, "BUY" if delta > 0 else "SELL", abs(delta), state, path)
 
@@ -320,6 +346,13 @@ def main():
                         "side. Refuses if the state file exists and the bot is in a position (rm it to roll).")
     p.add_argument("--pivot", help="pivot price (required with --init; ignored otherwise)")
     p.add_argument("--quantity", help="position size q in base-asset units (required with --init; ignored otherwise)")
+    bias = p.add_mutually_exclusive_group()
+    bias.add_argument("--long-only", action="store_true",
+                      help="directional bias, locked at --init: only ever hold +q. A bearish flip FLATTENS to 0 "
+                           "(never goes short), then waits to re-buy on the next bullish crossing.")
+    bias.add_argument("--short-only", action="store_true",
+                      help="directional bias, locked at --init: only ever hold -q. A bullish flip FLATTENS to 0 "
+                           "(never goes long), then waits to re-sell on the next bearish crossing.")
     add_network_args(p)
     args = p.parse_args()
 
@@ -328,9 +361,9 @@ def main():
             raise SystemExit(f"{PROG}: --init requires --pivot and --quantity.")
         do_init(args)
     else:
-        if args.pivot or args.quantity:
-            print(f"{PROG}: note -- --pivot/--quantity are ignored in normal mode (read from the state file).",
-                  file=sys.stderr)
+        if args.pivot or args.quantity or args.long_only or args.short_only:
+            print(f"{PROG}: note -- --pivot/--quantity/--long-only/--short-only are ignored in normal mode "
+                  f"(the strategy is read from the state file locked at --init).", file=sys.stderr)
         do_run(args)
 
 
