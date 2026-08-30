@@ -15,14 +15,10 @@ All monetary values are full quote-currency (USDC) decimal strings:
 """
 
 import argparse
-import os
-import re
-import sys
 import urllib.parse
-from arcus_common_public import NETWORKS, get_json, num, require_dict   # shared public helpers (formerly local copies)
+from arcus_common_public import add_network_args, require_eth_address, run_pipe_safe, NETWORKS, get_json, num, require_dict   # shared public helpers (formerly local copies)
 
 BASE = None   # set in main() from the required --testnet/--staging/--mainnet selector
-ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 
 def count_positions(positions):
@@ -52,21 +48,13 @@ def main():
     parser.add_argument("--header", action="store_true",
                         help="with --condensed, print an 'equity' header line first "
                              "(error if used without --condensed)")
-    net = parser.add_mutually_exclusive_group(required=True)
-    net.add_argument("--testnet", dest="network", action="store_const", const="testnet",
-                     help="query the testnet server")
-    net.add_argument("--staging", dest="network", action="store_const", const="staging",
-                     help="query the staging server")
-    net.add_argument("--mainnet", dest="network", action="store_const", const="mainnet",
-                     help="query the mainnet server")
+    add_network_args(parser)
     args = parser.parse_args()
     BASE = NETWORKS[args.network]
     address = args.address
 
     # Cheap local check -> a clear error before any network round-trip.
-    if not ADDR_RE.match(address):
-        raise SystemExit(f"display_balance: invalid Ethereum address {address!r} "
-                         f"(expected 0x + 40 hex chars).")
+    require_eth_address(address, "display_balance")
     if args.header and not args.condensed:
         raise SystemExit("display_balance: --header requires --condensed.")
 
@@ -103,13 +91,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except BrokenPipeError:
-        # A downstream reader closed early (e.g. `... | head`). Point stdout at devnull so the interpreter's
-        # shutdown flush can't re-raise BrokenPipeError, then exit cleanly -- this tool is meant for piping.
-        try:
-            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        except Exception:
-            pass
-        sys.exit(0)
+    run_pipe_safe(main)
