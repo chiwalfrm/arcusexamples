@@ -1,5 +1,5 @@
 """
-market_maker.py -- simple two-sided POST-ONLY quoter loop for Arcus testnet.
+market_maker.py -- simple two-sided POST-ONLY quoter loop for Arcus.
 
   python3 market_maker.py 500 0.03                      # BTC-USD, $500/side, +/-3%
   python3 market_maker.py 500 0.03 --market ETH-USD --interval 15
@@ -44,7 +44,7 @@ import arcus_redis as account_cache
 import ordersign
 from ordersign import Signer
 from arcus_common_private import (add_network_args, check_order_response, clock_delta_ns, describe_error,
-                          load_creds, positive_decimal, request, resolve_market, retry_after_seconds,
+                          load_creds, positive_decimal, rate_limit_details, request, resolve_market,
                           select_network, server_clock_shim)
 
 
@@ -65,14 +65,16 @@ class RateLimited(Exception):
 
 
 def _raise_if_rate_limited(e):
-    """If `e` is a 429, raise RateLimited (with the Retry-After backoff) so the caller aborts
-    the cycle and backs off, LEAVING resting quotes in place. No-op otherwise, so the caller
-    falls through to its normal fail-closed handling (pull quotes). Call this as the first line
-    of a read/write `except` before describe_error()/pull_quotes(): retry_after_seconds() reads
-    only the header, so the describe_error() body read here stays the single consumer of e."""
-    ra = retry_after_seconds(e)
-    if ra is not None:
-        raise RateLimited(ra, describe_error(e))
+    """If `e` is a 429, raise RateLimited (with a ms-precise backoff) so the caller aborts the cycle and
+    backs off, LEAVING resting quotes in place. No-op otherwise, so the caller falls through to its normal
+    fail-closed handling (pull quotes). Call this as the first line of a read/write `except` before
+    describe_error()/pull_quotes(): rate_limit_details() reads the body ONCE (for the ms-precise retryAfterMs
+    + reason), and since a 429 RAISES here the caller catches RateLimited and never calls describe_error(),
+    so that body read stays the single consumer of e."""
+    d = rate_limit_details(e)
+    if d is not None:
+        secs, _reason, detail = d
+        raise RateLimited(secs, detail)
 
 QUOTE_TIF = "ALO"                       # post-only: a quote can never take liquidity
 # (goodTilTime is now computed SERVER-aligned in MarketMaker._far_future_us, not from the raw local clock)
@@ -124,6 +126,16 @@ ORACLE_BOOTSTRAP_SRC = "oracle-bootstrap"
 # prevents. Post-only/ALO still stops us ever crossing a real book if liquidity reappears.
 ORACLE_STALE_SRC = "oracle-stale"
 
+# #5 proactive rate-limit pacing (see MarketMaker.call / _throttle_delay). Each write response carries
+# rateLimit:{pool, remaining} where remaining = floor(cap - consumed) -- the ABSOLUTE tokens left in that
+# per-subaccount pool (order: place/modify; cancel: cancelOrder). The cap GROWS with fill volume, so a fill
+# raises it and the very next response's `remaining` reflects that -- we never track cap/volume ourselves.
+# Once a pool is exhausted the venue drips 1 action / 10s; we watch `remaining` and, below --rate-limit-buffer,
+# RAMP the pre-write delay 0 -> this so we glide into the drip rate instead of slamming into it (429 storm).
+# remaining == -1 is the "account layer not enforced" sentinel (whitelisted/high-volume accounts) -> full speed.
+RL_DRIP_PERIOD_S = 10.0    # the exhausted-pool drip cadence we ramp write spacing toward
+RL_THROTTLE_LOG_S = 30.0   # throttle the "pacing" stderr notice to at most once per this many seconds
+
 RUNNING = True
 
 
@@ -152,7 +164,15 @@ def bbo_top_of_book(blob, now, max_age):
     any real bbo, or a market with no book) is NOT a usable book: returning None makes the caller fall
     back to the REST l2OrderBook instead of quoting oracle-only with no top-of-book/passive context.
     Pure (no Redis) so it's unit-testable. A FRESH ONE-sided blob IS authoritative -- the caller takes
-    the oracle mid, exactly like a one-sided REST book."""
+    the oracle mid, exactly like a one-sided REST book.
+
+    FRESHNESS SEMANTICS: `ts` is the PUBLISHER's write time (FEED liveness) -- refreshed on the publisher's
+    heartbeat even when the top-of-book has NOT changed. So `0 <= age <= max_age` means "the wsorderbook feed
+    is alive", NOT "the venue's top-of-book moved recently". The blob ALSO carries the venue's own `timestamp`
+    (published verbatim) for any consumer that wants venue-side freshness, but we deliberately do NOT age off
+    it: a genuinely QUIET market has an old venue timestamp while its BBO is still perfectly current, so ageing
+    off it would false-reject exactly the thin/quiet markets this feed exists to serve. A wedged-but-connected
+    venue feed (a frozen BBO on a MOVING market) is a rare separate failure not covered here."""
     if not isinstance(blob, dict):
         return None
     try:
@@ -184,7 +204,17 @@ def bbo_top_of_book(blob, now, max_age):
         # present side must be a finite POSITIVE price. is_finite() FIRST short-circuits the `> 0` compare,
         # which would RAISE on a NaN. A zero/negative top-of-book is corrupt (a 0 bid would drag the mid down
         # and quote ~half price) -> reject the blob rather than quote off it.
-        return price if (price.is_finite() and price > 0) else _BAD
+        if not (price.is_finite() and price > 0):
+            return _BAD
+        # Defense-in-depth, mirroring the publisher's _bbo_ok (which requires BOTH price AND size finite-positive):
+        # a present side with a valid price but a missing/NaN/<=0 SIZE is a poisoned/partial blob the publisher
+        # would never have written -> reject wholesale. (size is unused for quoting today, so this only rejects a
+        # malformed feed, never a valid one.)
+        try:
+            size = Decimal(str(lvl.get("size")))
+        except (InvalidOperation, TypeError):
+            return _BAD
+        return price if (size.is_finite() and size > 0) else _BAD
     bid, ask = px("bestBid"), px("bestAsk")
     if bid is _BAD or ask is _BAD:
         return None            # a present-but-corrupt side -> reject the whole blob -> caller falls back to REST
@@ -230,6 +260,14 @@ class MarketMaker:
         self.alternate_strategy = args.alternate_strategy  # size the REDUCING side to fully exit the position + one usd (flatten-and-flip) instead of the 2x skew; keeps the max-position cap
         # last (price, qty) we believe is RESTING per side -> skip a modify when nothing changed
         self.last_quote = {self.bid_cid: None, self.ask_cid: None}
+        self._state_confirmed = False  # True once an AUTHORITATIVE (fresh) openOrders read has succeeded. Until then,
+                                       # "last_quote all None" must NOT be read as "we are flat" -- a failed startup
+                                       # seed can leave a prior run's resting 365-day GTT quote untracked (see
+                                       # _fallback_disabled_pull, which else would park it WITHOUT canceling).
+        # #5 proactive rate-limit pacing: ease off write cadence once a pool's remaining drops below this.
+        self.rl_buffer = args.rate_limit_buffer
+        self._pool_remaining = {"order": None, "cancel": None}   # latest write-response rateLimit.remaining (None/-1 => full speed)
+        self._rl_log_last = 0.0                                  # monotonic; throttles the pacing notice
         self.clock_delta_ns = 0          # (server - local) offset in ns; measured by refresh_clock_delta()
         self._next_clock_check = 0.0      # time.monotonic() deadline for the next offset measurement
         self._clock_sampled = False       # True after the FIRST successful /v1/time sample -- run() won't quote until then
@@ -244,8 +282,75 @@ class MarketMaker:
         return account_cache.cached_get(self.net, address, name, fetch_fn, self.cache_ttl)
 
     # ── HTTP (raises on error; the loop classifies it and survives) ──────────
-    def call(self, method, path, body=None, headers=None):
-        return request(method, path, body, headers)
+    @staticmethod
+    def _write_pool(method, path):
+        """Which per-subaccount rate-limit pool a WRITE charges, or None for reads / non-charging paths (those
+        touch only the IP-weight layer, not the order/cancel pools). placeOrder/modifyOrder -> 'order';
+        cancelOrder/cancelAllOrders -> 'cancel'."""
+        if method != "POST":
+            return None
+        p = path.lower()
+        if "cancel" in p:
+            return "cancel"
+        if "placeorder" in p or "modifyorder" in p:
+            return "order"
+        return None
+
+    def _throttle_delay(self, pool, risk_off=False):
+        """#5: seconds to wait BEFORE a write to `pool`, from its last-seen rateLimit.remaining. Full speed
+        until --rate-limit-buffer of headroom, then RAMP 0 -> RL_DRIP_PERIOD_S as remaining -> 0 so we glide
+        into the 1-action/10s drip instead of slamming into it. remaining == -1 (not-enforced sentinel) /
+        unknown / buffer<=0 -> full speed; remaining <= 0 (exhausted) -> the full drip spacing.
+        risk_off=True (shutdown / pull_quotes): a ONE-SHOT burst of a few cancels, not sustained quoting, so
+        SKIP the gliding ramp when there's real headroom -- fire now rather than pay a glide meant to pace a
+        continuous quote loop toward the limit. The exhausted (rem<=0) drip wait still applies: it's unavoidable
+        (firing would just 429), and there sleeping lets a drip token replenish so the risk-off cancel succeeds."""
+        rem = self._pool_remaining.get(pool)
+        if rem is None or rem == -1 or self.rl_buffer <= 0:
+            return 0.0
+        if rem <= 0:                              # pool EXHAUSTED -> already on the drip (unavoidable even risk-off)
+            return RL_DRIP_PERIOD_S
+        if risk_off:                              # terminal risk-off burst WITH headroom -> fire now, no glide
+            return 0.0
+        if rem >= self.rl_buffer:                 # comfortable headroom
+            return 0.0
+        return RL_DRIP_PERIOD_S * (self.rl_buffer - rem) / self.rl_buffer   # ramp: remaining buffer->0 == delay 0->DRIP
+
+    def _update_pool_remaining(self, default_pool, resp):
+        """After a write, record rateLimit.remaining per pool from the response (its own `pool` is authoritative).
+        An ABSENT rateLimit means rate limiting isn't configured -> full speed (clear to None)."""
+        if not isinstance(resp, dict):
+            return
+        rl = resp.get("rateLimit")
+        if not isinstance(rl, dict):
+            self._pool_remaining[default_pool] = None
+            return
+        pool = rl.get("pool") if isinstance(rl.get("pool"), str) else default_pool
+        rem = rl.get("remaining")
+        if isinstance(rem, bool):                 # bool is an int subclass -- reject a stray True/False
+            rem = None
+        self._pool_remaining[pool] = rem if isinstance(rem, int) else None
+
+    def _log_throttle(self, pool, delay):
+        """Throttled (>=1/RL_THROTTLE_LOG_S) notice that #5 pacing is slowing writes, so an operator sees the
+        bot easing off rather than silently stalling."""
+        now = time.monotonic()
+        if now - self._rl_log_last >= RL_THROTTLE_LOG_S:
+            self._rl_log_last = now
+            print(f"[{_ts()}] rate-limit pacing: {pool} pool remaining={self._pool_remaining.get(pool)} "
+                  f"< buffer {self.rl_buffer} -> waiting {delay:.1f}s before the next {pool} write", flush=True)
+
+    def call(self, method, path, body=None, headers=None, risk_off=False):
+        pool = self._write_pool(method, path)
+        if pool is not None:
+            delay = self._throttle_delay(pool, risk_off=risk_off)
+            if delay > 0:
+                self._log_throttle(pool, delay)
+                time.sleep(delay)
+        resp = request(method, path, body, headers)
+        if pool is not None:
+            self._update_pool_remaining(pool, resp)
+        return resp
 
     def refresh_clock_delta(self, startup=False):
         """Measure the (server - local) clock offset for server-aligned order timestamps, and ABORT
@@ -314,8 +419,25 @@ class MarketMaker:
         check_order_response(self.call("POST", f"/v1/placeOrder?{self.query}", body, headers), "placeOrder")
 
     def modify_quote(self, order_side, sside, cid, price, qty, order_id):
-        # Modify now identifies by orderId and signs the immutable fields (g/r/s/t) +
-        # the clientId echo; the replacement carries a fresh far-future goodTilTime.
+        # Identify the modify by orderId ONLY. The venue requires EXACTLY ONE of orderId/clientId in BOTH the
+        # signed payload AND the body -- sending both is rejected (HTTP 400 "provide exactly one of orderId or
+        # clientId (not both)", or 401 if the signature carries both; verified live 2026-08-20). ordersign
+        # requires order_id anyway, so we pass client_id=None (no `c` in the canonical payload) and DON'T put
+        # clientId in the body. `cid` stays a param for the caller/logging but is intentionally NOT sent; the
+        # replacement keeps the order's original clientId regardless (verified live), so live_quotes' cid-based
+        # tracking still finds it next cycle. (Changelog review, 2026-08-20 -- this modify path was previously
+        # broken: it sent both identifiers, so every MM modify would have failed.)
+        #
+        # QUEUE PRIORITY (venue contract): a modify is IN PLACE (keeps priority) only when price is unchanged
+        # AND size reduced AND goodTilTime unchanged; any price move / size increase / differing gtt is an
+        # atomic cancel+replace that LOSES priority. Here that means every modify is a cancel+replace: the
+        # common case is a price move (unavoidable -- and modify still beats cancel-then-place: atomic, no
+        # resting gap, one request), and we always stamp a FRESH gtt below. The one priority-preserving case
+        # (same-price size-REDUCE + echoed gtt) is deliberately NOT pursued: payoff is ~zero for a sole-LP bot
+        # (size shrinks only via inventory skew, which moves only on FILLS = a counterparty) and rare
+        # otherwise, AND we found no reliable observable to even verify priority was kept (orderId is preserved
+        # across cancel-replace; createdAt moved even on a same-price+reduce+echoed-gtt modify). Not worth
+        # touching the signing/gtt path for. (Changelog review #3.)
         gtt = self._far_future_us()
         # sign_modify_order mints its X-Timestamp from ordersign's internal time.time_ns(); the shim shifts it
         # by our cached self.clock_delta_ns so modify aligns EXACTLY like place_quote (no /v1/time fetch here).
@@ -326,21 +448,23 @@ class MarketMaker:
                 quantity_quantums=ordersign.size_to_quantums(f"{qty:f}", self.step),
                 good_til_time_ns_=ordersign.good_til_time_ns(gtt),
                 reduce_only=False, side=sside, time_in_force=ordersign.TIF_ALO,
-                order_id=order_id, client_id=cid)
+                order_id=order_id, client_id=None)     # orderId-only identity (venue exactly-one rule)
         body = {"address": self.address, "accountIndex": self.account_index, "marketId": self.market_id,
-                "orderId": order_id, "clientId": cid, "side": order_side, "timeInForce": QUOTE_TIF,
+                "orderId": order_id, "side": order_side, "timeInForce": QUOTE_TIF,
                 "price": f"{price:f}", "quantity": f"{qty:f}", "reduceOnly": False, "goodTilTime": gtt}
         check_order_response(self.call("POST", f"/v1/modifyOrder?{self.query}", body, headers), "modifyOrder")
 
-    def cancel_quote(self, cid):
+    def cancel_quote(self, cid, risk_off=False):
         # Same clock alignment as modify/place: shift ordersign's internal X-Timestamp by the cached offset so
         # the fail-closed quote pull can't 401 under host drift (within the ±MAX_CLOCK_SKEW_S the guard enforces).
+        # risk_off=True (shutdown / pull_quotes): skip the #5 gliding ramp so a terminal cancel burst with pool
+        # headroom fires immediately instead of pacing itself; the exhausted-pool drip wait still applies.
         with server_clock_shim(self.clock_delta_ns):
             headers = self.signer.sign_cancel_order(address=self.address, account_index=self.account_index,
                                                     market_id=self.market_id, client_id=cid)
         body = {"address": self.address, "accountIndex": self.account_index, "marketId": self.market_id,
                 "kind": "clientId", "clientId": cid}
-        check_order_response(self.call("POST", f"/v1/cancelOrder?{self.query}", body, headers), "cancelOrder")
+        check_order_response(self.call("POST", f"/v1/cancelOrder?{self.query}", body, headers, risk_off=risk_off), "cancelOrder")
 
     def pull_quotes(self):
         """Cancel any of THIS bot's resting quotes (both sides). Called when fresh pricing
@@ -366,7 +490,7 @@ class MarketMaker:
             print(f"  could not read open orders to pull quotes: {describe_error(e)}; canceling both sides best-effort")
             for cid in (self.bid_cid, self.ask_cid):
                 try:
-                    self.cancel_quote(cid)
+                    self.cancel_quote(cid, risk_off=True)
                     print(f"  pulled {cid} (unconfirmed read)")
                     self.last_quote[cid] = None                             # confirmed pulled -> forget it
                 except (OSError, json.JSONDecodeError, SystemExit) as ce:   # not-found / transport -> best-effort
@@ -380,7 +504,7 @@ class MarketMaker:
         for cid in (self.bid_cid, self.ask_cid):
             if cid in live:
                 try:
-                    self.cancel_quote(cid)
+                    self.cancel_quote(cid, risk_off=True)
                     print(f"  pulled {cid}")
                     self.last_quote[cid] = None                            # confirmed pulled -> forget it
                 except (OSError, json.JSONDecodeError, SystemExit) as e:   # SystemExit = 2xx REJECTED/ERROR body
@@ -391,6 +515,39 @@ class MarketMaker:
                     print(f"  pull {cid} failed: {describe_error(e)}; keeping last_quote to retry next cycle")
             else:
                 self.last_quote[cid] = None                               # not resting (fresh read) -> nothing to pull
+
+    def _risk_off_on_429(self, e, what):
+        """For a RISK read (position / free collateral / openOrders) that errored: if `e` is a 429/1015 we go
+        RISK-OFF and back off. Leave-quotes-on-429 is right for PRICING reads (avoid a cancel storm; ALO can't
+        take), but a RISK read we can't complete means inventory/collateral is UNKNOWN -- leaving 365-day GTT
+        quotes resting there is fail-OPEN (a resting quote can still be picked off, breaching --max-position /
+        --min-collateral, exactly during a Cloudflare 1015 storm). pull_quotes' openOrders GET would 429 too, so
+        cancel BOTH sides BY CLIENTID (cache-independent, NO read; idempotent -- a not-resting cid returns a
+        harmless CANCEL_ACKNOWLEDGED), THEN raise RateLimited so run() honors Retry-After. NO-OP (returns) when
+        `e` is not a rate-limit error, so the caller falls through to its normal fail-closed pull_quotes().
+        Bounded: a cancel that itself 429s KEEPS last_quote and is retried next cycle; once flat there's nothing
+        to cancel, so it does not fire into the storm indefinitely."""
+        d = rate_limit_details(e)          # reads the 429 body ONCE (the single consumer of `e`); None if not 429/1015
+        if d is None:
+            return                         # not throttled -> caller does its normal pull_quotes()
+        secs, _reason, detail = d
+        if not (self.max_position is not None or self.min_collateral is not None or self.alternate_strategy):
+            # No inventory/collateral guard configured -> a resting quote can breach nothing, so PRESERVE the
+            # deliberate leave-quotes-on-429 behavior (this openOrders read runs every cycle; cancelling here
+            # would just churn quotes on a transient 429). Just back off. (position/collateral reads only run
+            # when their guard IS set, so they never reach this early-out.)
+            raise RateLimited(secs, detail)
+        print(f"[{_ts()}] {what} read 429/1015 -> risk-off cancel (no read) then backing off ({detail})")
+        for cid in (self.bid_cid, self.ask_cid):
+            if self.last_quote.get(cid) is None:
+                continue                   # not one we believe is resting -> skip (no needless write into the storm)
+            try:
+                self.cancel_quote(cid, risk_off=True)   # by clientId, no openOrders GET; risk_off skips the #5 glide
+                self.last_quote[cid] = None             # confirmed pulled -> forget it
+            except (OSError, json.JSONDecodeError, SystemExit) as ce:
+                # the cancel itself may 429 in the storm -> best-effort: KEEP last_quote so next cycle retries it
+                print(f"[{_ts()}]   risk-off cancel {cid} failed ({describe_error(ce)}); keeping last_quote to retry")
+        raise RateLimited(secs, detail)
 
     # ── State reads ───────────────────────────────────────────────────────────
     def _order_is_ours(self, o):
@@ -429,6 +586,8 @@ class MarketMaker:
         orders = src.get("orders")
         if not isinstance(orders, list):
             raise ValueError(f"openOrders 'orders' is {type(orders).__name__}, not a list")
+        if fresh:                       # an AUTHORITATIVE (uncached) read succeeded -> last_quote is now trustworthy:
+            self._state_confirmed = True   # "empty last_quote" reliably means flat (see _fallback_disabled_pull)
         live = {}
         for o in orders:
             if not isinstance(o, dict):
@@ -657,7 +816,14 @@ class MarketMaker:
         top each cycle, so we resume the instant the feed is fresh again."""
         resting = [cid for cid in (self.bid_cid, self.ask_cid) if self.last_quote[cid] is not None]
         if not resting:
-            return   # already flat -> stay silent (no REST); the top-of-cycle Redis read is what resumes us
+            if self._state_confirmed:
+                return   # genuinely flat (an authoritative fresh read confirmed it) -> stay silent (no REST); the
+                         # top-of-cycle Redis read is what resumes us
+            # State NEVER confirmed (startup seed failed + no fresh openOrders read since) -> we CANNOT assume flat:
+            # a prior run's untracked 365-day GTT quote may still rest. Fall through and best-effort cancel BOTH cids
+            # by clientId (idempotent -- a not-resting cid returns a harmless CANCEL_ACKNOWLEDGED) rather than park a
+            # possibly-resting quote on a moving market.
+            resting = [self.bid_cid, self.ask_cid]
         # Jitter so 37 bots don't fire their cancels in one synchronized burst; shutdown-responsive.
         self._sleep_responsive(random.uniform(0, DISABLE_FALLBACK_PULL_JITTER_MAX))
         if not RUNNING:
@@ -748,7 +914,7 @@ class MarketMaker:
         try:
             pos = self.position() if (self.max_position is not None or self.alternate_strategy) else None
         except (OSError, json.JSONDecodeError) as e:
-            _raise_if_rate_limited(e)   # 429 -> back off, LEAVE quotes resting
+            self._risk_off_on_429(e, "position")   # 429/1015 -> risk-off cancel (no read) + raise; else no-op below
             print(f"[{_ts()}] position read failed ({describe_error(e)}); pulling quotes")
             self.pull_quotes(); return
 
@@ -818,7 +984,7 @@ class MarketMaker:
             try:
                 fc = self.free_collateral()
             except (OSError, json.JSONDecodeError) as e:
-                _raise_if_rate_limited(e)   # 429 -> back off, LEAVE quotes resting
+                self._risk_off_on_429(e, "collateral")   # 429/1015 -> risk-off cancel (no read) + raise; else no-op
                 print(f"[{_ts()}] collateral read failed ({describe_error(e)}); pulling quotes")
                 self.pull_quotes(); return
             if fc is None:
@@ -841,7 +1007,7 @@ class MarketMaker:
         try:
             live = self.live_quotes()
         except (OSError, json.JSONDecodeError, ValueError) as e:   # ValueError = malformed openOrders body
-            _raise_if_rate_limited(e)   # 429 -> back off, LEAVE quotes resting
+            self._risk_off_on_429(e, "openOrders")   # 429/1015 -> risk-off cancel (no read) + raise; else no-op below
             print(f"[{_ts()}] openOrders read failed ({describe_error(e)}); pulling quotes")
             self.pull_quotes(); return
         # Reconcile the CACHED openOrders against local truth before deciding place-vs-modify: if a side we
@@ -884,7 +1050,7 @@ class MarketMaker:
                     if resting_px == px and resting == qty:
                         self.last_quote[cid] = (px, qty)       # RECORD the adopted resting quote: keep otherwise never
                         actions.append(f"{oside}:keep")        # sets last_quote, so after a restart/cleared state the
-                                                               # stale-cache reconcile (704) had nothing to trigger on ->
+                                                               # stale-cache reconcile had nothing to trigger on ->
                                                                # a stale cache -> blind re-place -> DUPLICATE_CLIENT_ID
                     else:
                         self.modify_quote(oside, sside, cid, px, qty, order_id)
@@ -929,10 +1095,19 @@ class MarketMaker:
                     # A failed PLACE/MODIFY: LEAVE last_quote as-is (do NOT clear). A modify targets a RESTING
                     # order, so a failed modify leaves the original resting; a failed PLACE we believed was placed
                     # (last_quote set -- e.g. a DUPLICATE_CLIENT_ID reject because the order actually still rests)
-                    # also still rests. Clearing would drop the stale-cache reconcile protection (704) -> next cycle
+                    # also still rests. Clearing would drop the stale-cache reconcile protection -> next cycle
                     # a blind re-place -> DUPLICATE. Keeping SELF-HEALS: next cycle's reconcile does a fresh re-read
-                    # and correctly modifies-or-places. (A genuinely-new place that failed had last_quote None
-                    # already, so leaving it is also correct.) Never fatal (a transient reject re-quotes next loop).
+                    # and correctly modifies-or-places. Never fatal (a transient reject re-quotes next loop).
+                    if self.last_quote.get(cid) is None:
+                        # COLD-PLACE self-heal: a place we believed was NEW (last_quote None) but that REJECTED --
+                        # most importantly DUPLICATE_CLIENT_ID, meaning the order ACTUALLY RESTS (a prior run's
+                        # 365-day GTT quote under this clientId, or a place that applied at the venue but read back
+                        # as failed). Leaving last_quote None left the reconcile guard (which fires ONLY when
+                        # last_quote is set) UNARMED, so every cycle re-placed into DUPLICATE until the cache
+                        # happened to show it. RECORD the intended quote so next cycle's fresh re-read reconciles:
+                        # it ADOPTS/MODIFIES if the order rests, or (a fresh read that shows it does NOT rest)
+                        # re-places cleanly. Safe for a genuine new-place failure too -- the fresh read is authoritative.
+                        self.last_quote[cid] = (px, qty)
                     actions.append(f"{oside}:ERR {describe_error(e)} (last_quote kept)")
         tail = ("  [" + " ".join(notes) + "]") if notes else ""
         print(f"[{_ts()}] mid={mid:.4f}({ref})  " + "  ".join(actions) + tail)
@@ -958,7 +1133,7 @@ class MarketMaker:
 
     def _seed_last_quote(self):
         """STARTUP: seed last_quote from any of THIS bot's currently-resting orders (matched by clientId in
-        live_quotes), so cycle 1's stale-cache reconcile (704) is already ARMED. Without it a fresh process has
+        live_quotes), so cycle 1's stale-cache reconcile is already ARMED. Without it a fresh process has
         last_quote None, so a STALE cache in the FIRST cycle could blind re-place a still-resting quote ->
         DUPLICATE_CLIENT_ID (finding-1's keep only arms it from a cycle that actually saw the order, i.e. cycle
         2+). Best-effort: a failed/blocked read just leaves last_quote empty (== prior behavior), never worse."""
@@ -1033,7 +1208,7 @@ class MarketMaker:
             targets = remaining if remaining is not None else [self.bid_cid, self.ask_cid]
             for cid in targets:
                 try:
-                    self.cancel_quote(cid)
+                    self.cancel_quote(cid, risk_off=True)
                 except (OSError, json.JSONDecodeError, SystemExit) as e:   # SystemExit = 2xx REJECTED/ERROR body
                     print(f"  {cid}: cancel error: {describe_error(e)}")    # the fresh openOrders read below is the source of truth
             # Confirm via a FRESH read (NOT the cache -- it could be stale and falsely show gone).
@@ -1066,12 +1241,17 @@ class MarketMaker:
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 def parse_args():
-    p = argparse.ArgumentParser(description="Two-sided post-only market-maker loop for Arcus testnet.")
+    p = argparse.ArgumentParser(description="Two-sided post-only market-maker loop for Arcus.")
     p.add_argument("usd", help="USD to quote per side (> 0)")
     p.add_argument("spread", help="half-spread off mid, fraction in [0, 1) (e.g. 0.03 = 3%%)")
     p.add_argument("--market", default="BTC-USD", help="market display name (default BTC-USD)")
     p.add_argument("--interval", type=float, default=15, help="refresh seconds (> 0, default 15)")
     p.add_argument("--cycles", type=int, default=0, help="stop after N cycles (>= 0; 0 = forever)")
+    p.add_argument("--rate-limit-buffer", type=int, default=100, metavar="N",
+                   help="proactive rate-limit pacing: once a per-subaccount WRITE pool's remaining tokens drop "
+                        "below N, ease off write cadence (ramp toward the venue's 1-action/10s drip) instead of "
+                        "slamming into 429s; 0 disables. Default 100. A whitelisted/high-volume account reports "
+                        "remaining=-1 (layer not enforced) and is never throttled.")
     p.add_argument("--max-position", help="cap |position| in base units; stop growing past it. ALSO enables "
                                           "inventory-skew: reducing side quotes 2x usd once |pos| >= 50%% of this")
     p.add_argument("--min-collateral", help="pull quotes when freeCollateral < this (USD)")
@@ -1115,6 +1295,8 @@ def parse_args():
         raise SystemExit("--cycles: must be >= 0.")
     if a.cache_ttl < 1:
         raise SystemExit("--cache-ttl: must be >= 1.")
+    if a.rate_limit_buffer < 0:
+        raise SystemExit("--rate-limit-buffer: must be >= 0 (0 disables proactive pacing).")
     if a.cache_ttl >= a.interval:
         print(f"WARNING: --cache-ttl {a.cache_ttl}s >= --interval {a.interval}s; the cache may not refresh "
               f"each cycle (and a bot may not see its own just-placed orders). Use a TTL below the interval.")
