@@ -1,5 +1,5 @@
 """
-Cancel orders on Arcus testnet (v5 signing).
+Cancel orders on Arcus (v5 signing).
 
   python3 cancel_order.py --all                  # cancel every open order (all markets)
   python3 cancel_order.py --orderid 0xabc123      # cancel one order by its server order ID
@@ -35,7 +35,7 @@ from arcus_common_private import (add_network_args, call, check_order_response, 
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Cancel orders on Arcus testnet.")
+    parser = argparse.ArgumentParser(description="Cancel orders on Arcus.")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--all", action="store_true",
                        help="cancel every open order on the account (all markets)")
