@@ -11,12 +11,11 @@ import argparse
 import asyncio
 import json
 import os
-import re
 import sys
 import time
 
 import websockets
-from arcus_common_public import CACHE_TTL, REDIS_URL, dec, describe_error, emit as _emit, log_ts, make_publisher, now_iso, plan_reconnect_sleep, positive_int, setup_logger, ws_url   # shared public helpers (formerly local copies)
+from arcus_common_public import SUB_ERR_LIMIT, CACHE_TTL, REDIS_URL, dec, describe_error, emit as _emit, log_ts, make_publisher, now_iso, plan_reconnect_sleep, positive_int, require_eth_address, SubscriptionError, setup_logger, write_pidfile, ws_url   # shared public helpers (formerly local copies)
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -44,11 +43,11 @@ STABLE_AFTER    = 30         # s a connection must STAY UP before backoff resets
 OPEN_TIMEOUT    = 10
 PING_INTERVAL   = 20
 PING_TIMEOUT    = 20
-ADDR_RE         = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 CHANNELS = [
-    "accountAttributeUpdates",
+    "accountAttributeUpdates",   # incl. type=leverage/feeTier/leverageReject entries (leverageReject is NOT a separate channel)
     "account",
+    "accountTransferUpdates",     # v1.3.3: deposits/withdrawals/transfers/referral-claims audit trail (log-only, not cache-warmed)
     "funding",
     "orders",
     "positions",
@@ -142,8 +141,10 @@ def seed_orders(contents):
 def apply_order_update(orders, contents):
     """Apply one `orders` channel_data delta to the resting set, keyed by orderId. Membership is driven
     off the engine-authoritative `state` field (docs: clients can drive the state machine off it alone):
-    OPEN/PARTIALLY_FILLED -> upsert; FILLED/CANCELED/REJECTED -> remove. An update with an unrecognized/
-    missing state leaves the set UNCHANGED (conservative -- the periodic resubscribe self-heals any drift).
+    OPEN/PARTIALLY_FILLED -> upsert; FILLED/CANCELED/REJECTED -> remove -- EXCEPT a CANCELED whose
+    cancelReason is MODIFY_CANCELED, the transient cancel-leg of a modify, which is KEPT (the same orderId
+    is re-placed on the next update). An update with an unrecognized/missing state leaves the set UNCHANGED
+    (conservative -- the periodic resubscribe self-heals any drift).
     Returns True if the set changed (so the caller only republishes on a real change)."""
     if not isinstance(contents, dict):
         return False
@@ -157,6 +158,14 @@ def apply_order_update(orders, contents):
         orders[oid] = contents               # (clientId-bearing) version of this order; the resubscribe self-heals.
         return True
     if state in ORDER_STATE_TERMINAL:
+        # MODIFY_CANCELED = the FIRST leg of a modify: the SAME orderId is re-placed by the very next update,
+        # so it is NOT terminally gone (docs). Removing here would flicker the order OUT of the shared cache on
+        # every modify -- the MM (which reads this cache) would then see its order briefly missing and pay a
+        # fresh re-read via its stale-cache safeguard. Keep the existing cached order; the imminent re-place
+        # upserts its fresh state, and a dropped follow-up self-heals via the 60s resubscribe. Only a GENUINE
+        # terminal cancel (no marker) / FILLED / REJECTED removes it.
+        if contents.get("cancelReason") == "MODIFY_CANCELED":
+            return False
         return orders.pop(oid, None) is not None
     return False
 
@@ -175,6 +184,12 @@ async def handle_message(raw, loggers, add_ts, pub, ctx, state):
     if not isinstance(msg, dict):          # valid JSON but not an object (bare array/number) -> STDOUT, keep reading
         print(raw)
         return
+    # Server subscription/request error (channel-less frame with an `error` object or status >= 400): raise so
+    # ws_loop reconnects instead of sitting on a dead subscription. Channel-less gate => real frames never match.
+    if msg.get("channel") is None and (isinstance(msg.get("error"), dict)
+                                       or (isinstance(msg.get("status"), int) and msg["status"] >= 400)):
+        err = msg.get("error") if isinstance(msg.get("error"), dict) else {}
+        raise SubscriptionError(err.get("message") or f"status {msg.get('status')}: {err or msg}")
 
     channel = msg.get("channel")
     logger = loggers.get(channel)
@@ -230,6 +245,7 @@ async def _warm(pub, state, key, name, blob):
 # ── WebSocket loop ───────────────────────────────────────────────────────────
 async def ws_loop(url, subscriptions, loggers, add_ts, pub, ctx, reconnect_interval=None):
     delay = RECONNECT_BASE
+    sub_errs = 0                               # consecutive subscription rejections; reset once a connection is stable
     while True:
         conn_start = None
         # Per-connection cache state: resting-order set + last-good blobs for the heartbeat republish.
@@ -276,6 +292,13 @@ async def ws_loop(url, subscriptions, loggers, add_ts, pub, ctx, reconnect_inter
                     # No redis: the original loop, untouched.
                     async for raw in ws:
                         await handle_message(raw, loggers, add_ts, None, ctx, state)
+        except SubscriptionError as e:
+            # Reconnectable, not fatal: resubscribe on a fresh socket with the normal backoff. Give up only
+            # after SUB_ERR_LIMIT rejections in a row with no stable connection between (a genuinely bad sub).
+            sub_errs += 1
+            if sub_errs >= SUB_ERR_LIMIT:
+                raise SystemExit(f"wsaccount: subscription rejected {sub_errs}x in a row, giving up: {e}")
+            print(f"[{log_ts()}] [sub error] {e} — resubscribing (attempt {sub_errs}, with backoff)", file=sys.stderr)
         except websockets.ConnectionClosedOK:
             print(f"[{log_ts()}] [ws] connection closed — reconnecting", file=sys.stderr)   # CLEAN close (redis path: ws.recv() raises this) -> NOT an error
         except Exception as e:
@@ -288,6 +311,8 @@ async def ws_loop(url, subscriptions, loggers, add_ts, pub, ctx, reconnect_inter
         # With --reconnect-interval: immediate on a genuine drop, else a flat ~interval wait -- so a
         # synchronized mass-disconnect of a large fleet stays under the per-IP new-conns/min cap (see
         # plan_reconnect_sleep).
+        if conn_start is not None and time.monotonic() - conn_start >= STABLE_AFTER:
+            sub_errs = 0                        # the connection proved stable => subscriptions are fine
         sleep_s, delay = plan_reconnect_sleep(
             conn_start, time.monotonic(), delay, RECONNECT_BASE, RECONNECT_MAX, STABLE_AFTER,
             reconnect_interval)
@@ -297,9 +322,7 @@ async def ws_loop(url, subscriptions, loggers, add_ts, pub, ctx, reconnect_inter
 # ── Entry point ──────────────────────────────────────────────────────────────
 async def amain(args):
     address = args.address
-    if not ADDR_RE.match(address):
-        raise SystemExit(f"wsaccount: invalid Ethereum address {address!r} "
-                         f"(expected 0x + 40 hex chars).")
+    require_eth_address(address, "wsaccount")
 
     # Always subscribe to the full fixed channel set (like wsexchange.py / wsorderbook.py). Each channel
     # logs to its own file, so there's nothing to gain from a subset -- and letting the operator pick one
@@ -387,6 +410,7 @@ def main():
         args.url = ws_url(args.network)
     if args.log_dir is None:
         args.log_dir = os.path.join(LOG_BASE, args.network)
+    write_pidfile(args.log_dir, f"wsaccount-{args.address}")   # liveness marker: monitor checks the PID is alive
     try:
         asyncio.run(amain(args))
     except KeyboardInterrupt:
