@@ -18,7 +18,3 @@ Note: Arcus API keys can only place trades, they can't withdraw or transfer fund
 
 **Configuration**
 - Create directory /mnt/arcuslogs (with u+rwx permissions).  Logs go here.
-
-**If you use this project, please ⭐ (star) or 👁️ (watch) it so I know how many people use it.**
-
-Note: private/ordersign.py is provided by dYdX Trading, Inc.  All rights reserved.
