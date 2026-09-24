@@ -1,4 +1,4 @@
-**September 22, 2026 News: Files moved to official github repo https://github.com/dydxprotocol/arcustools**
+**September 24, 2026 News: Files moved to https://github.com/chiwalfrm/arcustools**
 
 Recommended OS: Ubuntu 24.04.4 LTS server
 
